@@ -42,6 +42,8 @@ pub enum Place {
     Metatable(HashRef),
     /// The table in hash key `h`'s field, through its witness: an `__index`.
     Index(HashRef),
+    /// The metatable of the hash key's register's userdata. See Note [Arithmetic metamethods].
+    UserdataMetatable,
 }
 
 impl Place {
@@ -51,6 +53,7 @@ impl Place {
             Place::Register => 0,
             Place::Metatable(h) => 1 << 8 | h.0 as u16,
             Place::Index(h) => 2 << 8 | h.0 as u16,
+            Place::UserdataMetatable => 3 << 8,
         }
     }
 
@@ -59,8 +62,14 @@ impl Place {
         match bits >> 8 {
             0 => Place::Register,
             1 => Place::Metatable(h),
-            _ => Place::Index(h),
+            2 => Place::Index(h),
+            _ => Place::UserdataMetatable,
         }
+    }
+
+    /// Whether the table is found from the hash key's own register, which its hash keys live with.
+    pub fn own_register(self) -> bool {
+        matches!(self, Place::Register | Place::UserdataMetatable)
     }
 }
 use crate::perf::PerfCounters;
@@ -557,6 +566,14 @@ impl<'src, 'intern> Table<'src, 'intern> {
     /// part's in order and then the hash part's, or none past the last; or `Err` for a key it
     /// doesn't hold. The keys it gives back are canonical, but for the array part's, integers.
     pub fn next(&self, key: LBoxed<'src, 'intern>) -> Result<Option<(LBoxed<'src, 'intern>, LBoxed<'src, 'intern>)>, ()> {
+        Ok(self.next_from(key, usize::MAX)?.map(|(key, value, _)| (key, value)))
+    }
+
+    /// `next`, where `key`'s entry may be at `hint` in the hash part, which saves finding it when it
+    /// is there: the entry, and where in the hash part it is, for the next step's hint (`usize::MAX`
+    /// for the array part's). A table's keys are unique, so the entry at `hint` holding `key` is
+    /// `key`'s, wherever the hint came from.
+    pub fn next_from(&self, key: LBoxed<'src, 'intern>, hint: usize) -> Result<Option<(LBoxed<'src, 'intern>, LBoxed<'src, 'intern>, usize)>, ()> {
         let in_array = match key.unbox() {
             LValue::Nil => Some(0),
             _ => key.as_number().and_then(array_slot).filter(|&slot| slot < self.array.len()).map(|slot| slot + 1),
@@ -564,21 +581,22 @@ impl<'src, 'intern> Table<'src, 'intern> {
         let from = match in_array {
             Some(from) => {
                 if let Some((i, value)) = self.array[from..].iter().enumerate().find(|(_, value)| !value.is_nil()) {
-                    return Ok(Some((LBoxed::from_int((from + i + 1) as i32), *value)));
+                    return Ok(Some((LBoxed::from_int((from + i + 1) as i32), *value, usize::MAX)));
                 }
                 0
             }
             None => {
-                let at = match key.unbox() {
-                    LValue::OwnedString(g) => self.hash.get_index_of(&StringBytes(g.as_slice())),
-                    LValue::Integer(i) => self.hash.get_index_of(&LCanon::number(i as f64)),
-                    LValue::Double(n) => self.hash.get_index_of(&LCanon::number(n.0)),
+                let at = match (self.hash.get_index(hint), key.unbox()) {
+                    (Some((held, _)), _) if held.boxed().bits() == key.bits() => Some(hint),
+                    (_, LValue::OwnedString(g)) => self.hash.get_index_of(&StringBytes(g.as_slice())),
+                    (_, LValue::Integer(i)) => self.hash.get_index_of(&LCanon::number(i as f64)),
+                    (_, LValue::Double(n)) => self.hash.get_index_of(&LCanon::number(n.0)),
                     _ => self.hash.get_index_of(&LCanon(key)),
                 };
                 at.ok_or(())? + 1
             }
         };
-        Ok((from..self.hash.len()).filter_map(|i| self.hash.get_index(i)).find(|(_, value)| !value.is_nil()).map(|(key, value)| (key.boxed(), *value)))
+        Ok((from..self.hash.len()).find_map(|i| self.hash.get_index(i).filter(|(_, value)| !value.is_nil()).map(|(key, value)| (key.boxed(), *value, i))))
     }
 
     pub fn new(array: usize, hash: usize) -> Self {
@@ -764,6 +782,17 @@ impl<'src, 'intern> Tc<Table<'src, 'intern>> {
     /// Look up a string key by its bytes, which needs no intern arena: a key
     /// that's a string is interned, and this hashes as it does. See Note
     /// [Canonical values].
+    /// `t[key]` without its metatable, as `get`, but finding a string key by its bytes, which needs
+    /// no intern arena.
+    pub fn get_raw(&self, owner: &Owner, key: LBoxed<'src, 'intern>) -> LBoxed<'src, 'intern> {
+        match key.unbox() {
+            LValue::OwnedString(s) => self.get_string(owner, s.as_slice()),
+            LValue::Integer(i) => self.get_number(owner, i as f64),
+            LValue::Double(n) => self.get_number(owner, n.0),
+            _ => self.ro(owner).hash.get(&LCanon(key)).copied().unwrap_or(LBoxed::NIL),
+        }
+    }
+
     pub fn get_string(&self, owner: &Owner, bytes: &[u8]) -> LBoxed<'src, 'intern> {
         self.ro(owner).hash.get(&StringBytes(bytes)).copied().unwrap_or(LBoxed::NIL)
     }
@@ -923,6 +952,18 @@ pub enum LValue<'src, 'intern> {
 pub use crate::lboxed::LBoxed;
 use crate::lboxed::NClosureCell;
 pub use crate::lboxed::IStr;
+
+/// The keys a metatable's lookups read, Lua 5.1's events. A store to one moves its table to a new
+/// epoch whatever it stores. See Note [Table metatables].
+pub const METAMETHODS: [&[u8]; 17] = [
+    b"__index", b"__newindex", b"__gc", b"__mode", b"__eq", b"__add", b"__sub", b"__mul", b"__div",
+    b"__mod", b"__pow", b"__unm", b"__len", b"__lt", b"__le", b"__concat", b"__call",
+];
+
+/// Whether `key` is one of the metamethods' names (`METAMETHODS`).
+pub fn is_metamethod(key: LBoxed<'_, '_>) -> bool {
+    matches!(key.unbox(), LValue::InternedString(s) if METAMETHODS.contains(&s.as_bytes()))
+}
 
 /// Intern raw bytes into the arena, returning the canonical handle. The bytes are
 /// owned by the record (`Cow::Owned`), so the arena frees a deduped duplicate; it
@@ -1393,19 +1434,29 @@ pub enum Closure<'src, 'intern> {
 
 impl NClosure {
     pub fn new(native: NativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, None, false, false) }
+        NClosure { cell: NClosureCell::leak(native, None, None, false, false, None) }
+    }
+
+    /// A native whose only result is its argument `arg`. See Note [Library natives].
+    pub fn returning(native: NativeFunc, arg: u8) -> Self {
+        NClosure { cell: NClosureCell::leak(native, None, None, false, false, Some(arg)) }
+    }
+
+    /// The argument that is its only result, if it declares one. See Note [Library natives].
+    pub fn returns(&self) -> Option<usize> {
+        self.cell.returns.map(usize::from)
     }
 
     /// A pure native. See Note [Library natives].
     pub fn pure(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, false, None) }
     }
 
     /// `pcall`, whose call is laid out as a protected call of its first
     /// argument, `native` running only for a call site that doesn't specialize.
     /// See Note [Errors].
     pub fn protected_call(native: PureNativeFunc) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, true) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, None, true, true, None) }
     }
 
     /// Whether a call of it is a protected call of its first argument. See
@@ -1416,19 +1467,19 @@ impl NClosure {
 
     /// A pure native that runs as a window op where `window` gives one.
     pub fn pure_windowed(native: PureNativeFunc, window: NativeWindow) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), None, true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), Some(window), None, true, false, None) }
     }
 
     /// A pure native whose call is compiled by `generator`, as an opcode's is. See Note [Native
     /// generators].
     pub fn pure_generated(native: PureNativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
-        NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false) }
+        NClosure { cell: NClosureCell::leak(Self::called(native), None, Some(generator), true, false, None) }
     }
 
     /// A native whose call is compiled by `generator`, as an opcode's is. See Note [Native
     /// generators].
     pub fn generated(native: NativeFunc, generator: crate::specialize::NativeGenerator) -> Self {
-        NClosure { cell: NClosureCell::leak(native, None, Some(generator), false, false) }
+        NClosure { cell: NClosureCell::leak(native, None, Some(generator), false, false, None) }
     }
 
     /// The generator a call to this native is compiled by, if it has one.
@@ -1904,9 +1955,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         match clos.ro(owner).upvalues[index].deref().ro(owner) {
             // The running closure's upvalues were captured by an enclosing function,
             // so an open one is a slot of an enclosing frame, not one of this frame's
-            // (which the window may cache).
+            // (which the window may cache). Another closure's may be one of this
+            // frame's, read where the window is stored.
             Upvalue::Open(o) => {
-                debug_assert!(*o < self.base, "open upvalue in the running frame");
+                debug_assert!(*o < self.base || !std::ptr::eq(clos.ro(owner), self.clos.ro(owner)), "open upvalue in the running frame");
                 self.vals[*o as usize]
             },
             Upvalue::Closed(c) => *c.ro(owner),
@@ -2116,21 +2168,31 @@ impl<'src, 'intern> RunState<'src, 'intern> {
         next_stack
     }
 
-    /// Make the running frame, an inlined call's, the frame of a call returning to `ret`. See Note
-    /// [Sealed inlined calls].
-    pub fn uninline(&mut self, owner: &Owner, ret: PackedLocation) {
+    /// Make the running frame, an inlined call's, the frame of a call returning to `ret`, its
+    /// `witnesses` moved as `own_frame` moves them. See Note [Sealed inlined calls].
+    pub fn uninline(&mut self, owner: &Owner, ret: PackedLocation, witnesses: &[(u8, u8)]) {
         let entry = self.callstack.last_mut().expect("an inlined call's entry");
         debug_assert!(matches!(entry.ret, Return::Inlined(_)), "a call's frame made a call's again");
         entry.ret = Return::To(Location::unpack(ret));
-        self.own_frame(owner);
+        self.own_frame(owner, witnesses);
     }
 
     /// Give the running frame what a call's frame has that an inlined call's doesn't: the stack its
-    /// function's frame size long, and hash witnesses of its own. See Note [Sealed inlined calls].
-    pub fn own_frame(&mut self, owner: &Owner) {
+    /// function's frame size long, and hash witnesses of its own, each `(from, to)` of the region
+    /// it had moved to `to` of its own. See Note [Sealed inlined calls].
+    pub fn own_frame(&mut self, owner: &Owner, witnesses: &[(u8, u8)]) {
         let frame = unsafe { (*self.clos.ro(owner).prototype).frame_size.get() };
         self.lengthen_nilled(self.base + frame);
-        self.witness_base = self.witness_top;
+        let (had, own) = (self.witness_base, self.witness_top);
+        let len = witnesses.iter().map(|&(_, to)| to as usize + 1).max().unwrap_or(0);
+        if self.hash_witnesses.len() < own + len {
+            self.hash_witnesses.grow(own + len);
+        }
+        for &(from, to) in witnesses {
+            self.hash_witnesses[own + to as usize] = self.hash_witnesses[had + from as usize];
+        }
+        self.witness_base = own;
+        self.witness_top = own + len;
     }
 
     /// The frame of an inlined call of R(A), `callee`, with CALL's B, of a callee whose `max_stack`
@@ -2521,6 +2583,10 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             Place::Index(h) => {
                 let witness = self.hash_witnesses[self.witness_base + h.0 as usize];
                 unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.as_table()
+            },
+            Place::UserdataMetatable => match self.vals[self.base + slot].unbox() {
+                LValue::Userdata(u) => u.ro(owner).metatable().cloned(),
+                _ => None,
             },
         }
     }

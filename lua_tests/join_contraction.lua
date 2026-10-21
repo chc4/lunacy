@@ -7,6 +7,8 @@
 -- it once before its loop, so the loop is entered knowing the `versions`
 -- upvalue's identity, as its back edge does: no version of the loop is told
 -- apart by learning it.
+-- Its output counts versions, which an injected effect may rightly add to.
+-- FEATURE: !conservative_information
 
 local versions = jit.versions
 

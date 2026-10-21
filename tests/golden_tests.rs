@@ -78,9 +78,62 @@ fn run_timed(path: &Path, lua_baseline: bool) {
         // Read when the run starts, on the test's thread; nothing else runs meanwhile.
         unsafe { std::env::set_var("LUNACY_GAS", gas.to_string()) };
     }
+    // `LUNACY_GOLDEN_EFFECT_SEED`: each test run once to count the specializer's yields, then again
+    // with an effect applied at one the seed and its name choose, and which effect
+    // (`LUNACY_GOLDEN_EFFECT_AT`, `yield:effect`, instead names them): code knowing less must give
+    // the same output. See Note [Conservative information].
+    #[cfg(feature = "conservative_information")]
+    let named = std::env::var("LUNACY_GOLDEN_EFFECT_AT").ok().and_then(|s| {
+        let (at, effect) = s.split_once(':').unwrap_or((&s, "0"));
+        Some((at.parse::<u64>().ok()?, effect.parse::<usize>().ok()?))
+    });
+    #[cfg(feature = "conservative_information")]
+    let at = match (std::env::var("LUNACY_GOLDEN_EFFECT_SEED").ok(), named) {
+        (_, Some(at)) if !lua_baseline => Some(at),
+        (Some(seed), None) if !lua_baseline => {
+            let owned = path.to_path_buf();
+            let ticks = std::thread::spawn(move || {
+                run_test_file(&owned, lua_baseline);
+                lunacy::specialize::conservative::TICKS.with(|ticks| ticks.get())
+            }).join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::hash::DefaultHasher::new();
+            (seed, path).hash(&mut hasher);
+            let bits = hasher.finish();
+            (ticks > 0).then(|| (1 + bits % ticks, (bits >> 32) as usize % lunacy::specialize::conservative::EFFECTS.len()))
+        },
+        _ => None,
+    };
+    #[cfg(feature = "conservative_information")]
+    if let Some((at, effect)) = at {
+        println!("{} with effect {effect} at yield {at} (LUNACY_GOLDEN_EFFECT_AT={at}:{effect})", path.display());
+    }
+    // `LUNACY_GOLDEN_EFFECT_EVERY`: the test run with each effect at each of its yields in turn, and
+    // how many of those runs fail, to see how likely a random one is to.
+    #[cfg(feature = "conservative_information")]
+    if std::env::var_os("LUNACY_GOLDEN_EFFECT_EVERY").is_some() && !lua_baseline {
+        let owned = path.to_path_buf();
+        let ticks = std::thread::spawn(move || {
+            run_test_file(&owned, lua_baseline);
+            lunacy::specialize::conservative::TICKS.with(|ticks| ticks.get())
+        }).join().unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let effects = lunacy::specialize::conservative::EFFECTS.len();
+        let failed: Vec<String> = (1..=ticks).flat_map(|at| (0..effects).map(move |effect| (at, effect))).filter(|&(at, effect)| {
+            let owned = path.to_path_buf();
+            std::thread::spawn(move || {
+                lunacy::specialize::conservative::AT.with(|cell| cell.set(Some((at, effect))));
+                run_test_file(&owned, lua_baseline);
+            }).join().is_err()
+        }).map(|(at, effect)| format!("{at}:{effect}")).collect();
+        println!("{}: {} of {} effects at its {ticks} yields fail: {:?}", path.display(), failed.len(), ticks as usize * effects, &failed[..failed.len().min(20)]);
+        assert!(failed.is_empty(), "{} fails with {} of the effects at its yields", path.display(), failed.len());
+        return;
+    }
     let owned = path.to_path_buf();
     let (done, finished) = std::sync::mpsc::channel();
     let test = std::thread::spawn(move || {
+        #[cfg(feature = "conservative_information")]
+        lunacy::specialize::conservative::AT.with(|cell| cell.set(at));
         run_test_file(&owned, lua_baseline);
         let _ = done.send(());
     });
@@ -93,6 +146,20 @@ fn run_timed(path: &Path, lua_baseline: bool) {
 
 fn run_test_file(path: &Path, lua_baseline: bool) {
     let content = fs::read_to_string(path).unwrap();
+    // `-- FEATURE: watchpoints`: a test of what only that cargo feature has, skipped without it;
+    // `-- FEATURE: !conservative_information`, a test skipped with that feature.
+    let enabled = |feature: &str| match feature {
+        "watchpoints" => cfg!(feature = "watchpoints"),
+        "conservative_information" => cfg!(feature = "conservative_information"),
+        _ => panic!("{}: an unknown feature {feature}", path.display()),
+    };
+    let skipped = content.lines().filter_map(|l| l.strip_prefix("-- FEATURE: ")).any(|feature| match feature.strip_prefix('!') {
+        Some(feature) => enabled(feature),
+        None => !enabled(feature),
+    });
+    if !lua_baseline && skipped {
+        return;
+    }
     let expected: Vec<String> = content
         .lines()
         .filter(|l| l.starts_with("-- EXPECT: "))

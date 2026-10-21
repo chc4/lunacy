@@ -11,6 +11,9 @@ The specializer's are also views, one column per argument:
       block, the versions at the pc after it, the context requested, the join
       (if one was made), how many of the context's shapes it lost, and where
       each of its fragile facts was introduced (`fact <- block@offset,...`).
+  spec_subblock(ts, block, line, pc, context, inline)
+      each subblock created, compiling an instruction on from inside it: as
+      `spec_block`, but no version of a pc.
   spec_block(ts, block, line, pc, context, inline)
       each version created, whatever became of it since: counting its rows
       counts versions ever made, not versions in the graph (`point_versions`).
@@ -49,6 +52,11 @@ The specializer's are also views, one column per argument:
       each place code makes the frames of the inlined calls it is in, in
       `block` of the function at `line`: `by` the yield observing them, or
       the return opcode returning from one.
+  destination(line, pc, reused, block, moved, map, versions)
+      each switch of a sealed inlined call to its callee's own version at `pc`
+      of the function at `line`: whether it `reused` one of the `versions` the
+      callee had there, the `block` it goes to, and how many hash keys moved to
+      the destination's witnesses, as `from->to` hash key indexes (`map`).
   inline_calls(line, pc, callee, copies, entered, made)
       each call inlined, the function at `line`'s call at `pc` of the
       function defined at `callee`: how many copies of it were laid out, one
@@ -144,13 +152,16 @@ VIEWS = {
     'evicted': ['line', 'pc', 'blocks'],
     'inline': ['site', 'line', 'callee', 'after', 'call_block', 'shift', 'entry', 'context'],
     'inline_return': ['line', 'callee', 'after', 'block', 'context'],
-    'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'inlines', 'why'],
+    'inline_cost': ['line', 'callee', 'entry', 'blocks', 'cost', 'reused', 'found', 'inlines', 'why'],
     'inline_refused': ['line', 'callee', 'call_block', 'reason'],
     'frames_made': ['line', 'pc', 'block', 'by'],
     'frame_entered': ['site'],
     'frame_made': ['site'],
+    'destination': ['line', 'pc', 'reused', 'block', 'moved', 'map', 'versions'],
+    'spec_subblock': ['block', 'line', 'pc', 'context', 'inline'],
     'jit_bailout': ['reason', 'block_id', 'off', 'source', 'line'],
     'jit_compile': ['block_id', 'source', 'line'],
+    'jit_tier_up': ['block', 'entered_from', 'recent', 'exited', 'forced'],
     'jit_region': ['root', 'reached', 'selected', 'root_weight', 'under_1', 'under_10', 'under_25', 'under_50', 'under_100'],
 }
 EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 'block_summary': ('spec', 'block_summary'),
@@ -163,8 +174,10 @@ EVENTS = {'spec_version': ('spec', 'version'), 'spec_block': ('spec', 'block'), 
           'inline_cost': ('spec', 'inline_cost'), 'inline_refused': ('spec', 'inline_refused'),
           'frames_made': ('spec', 'frames_made'),
           'frame_entered': ('spec', 'frame_entered'), 'frame_made': ('spec', 'frame_made'),
+          'destination': ('spec', 'destination'),
+          'spec_subblock': ('spec', 'subblock'),
           'jit_bailout': ('jit', 'bailout'), 'jit_compile': ('jit', 'compile'),
-          'jit_region': ('jit', 'region')}
+          'jit_region': ('jit', 'region'), 'jit_tier_up': ('jit', 'tier_up')}
 
 
 def connect(trace):

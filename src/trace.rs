@@ -78,45 +78,7 @@ pub struct Block {
     pub ran: bool,
 }
 
-/// A set of stack slots. A Lua frame has at most 250.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Slots([u64; 4]);
-
-impl Slots {
-    pub fn insert(&mut self, slot: usize) {
-        assert!(slot < 256, "a frame slot below 256");
-        self.0[slot / 64] |= 1 << (slot % 64);
-    }
-
-    pub fn remove(&mut self, slot: usize) {
-        self.0[slot / 64] &= !(1 << (slot % 64));
-    }
-
-    pub fn contains(&self, slot: usize) -> bool {
-        slot < 256 && self.0[slot / 64] & (1 << (slot % 64)) != 0
-    }
-
-    pub fn union(&mut self, other: &Slots) {
-        for (a, b) in self.0.iter_mut().zip(other.0) {
-            *a |= b;
-        }
-    }
-
-    pub fn intersect(&mut self, other: &Slots) {
-        for (a, b) in self.0.iter_mut().zip(other.0) {
-            *a &= b;
-        }
-    }
-
-    /// Whether every slot in `other` is in `self`.
-    pub fn covers(&self, other: &Slots) -> bool {
-        self.0.iter().zip(other.0).all(|(a, b)| b & !a == 0)
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..256).filter(|&slot| self.contains(slot))
-    }
-}
+pub use crate::window::Slots;
 
 /// A region's blocks, the entry at index 0, with the edges between them.
 pub struct Region {

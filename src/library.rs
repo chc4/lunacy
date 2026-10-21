@@ -30,10 +30,16 @@ use crate::patterns::{self, Capture};
 // make new ones, but write none the program could already see, so a call to one
 // has no effects the specializer tracks.
 //
+// A native can declare that its only result is one of its arguments
+// (`setmetatable`'s table). A call to it then knows its result's type from the
+// argument's, and a return of it in tail position knows what it returns (Note
+// [Call continuations]).
+//
 // What a native can't be, as it keeps state between calls (`string.gmatch`'s
-// iterator) or calls a function (`string.gsub`'s replacement, `table.sort`'s
-// order), is written in Lua (src/library.lua), which the VM runs before each
-// program, in its global environment.
+// iterator), calls a function (`string.gsub`'s replacement, `table.sort`'s
+// order), or stores a string it was given as a key (`rawset`), is written in Lua
+// (src/library.lua), which the VM runs before each program, in its global
+// environment.
 //
 // Natives are plain functions, with no intern arena and no global table, so the
 // strings they make are owned, not interned. `require` finds the built-in
@@ -140,6 +146,9 @@ macro_rules! native {
     (pure |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::pure(native!(@fn $owner, $args, $body)))
     };
+    (returns: $arg:expr, |$owner:ident, $args:ident| $body:expr) => {
+        LValue::NClosure(NClosure::returning(native!(@fn $owner, $args, $body), $arg))
+    };
     (generator: $generator:expr, |$owner:ident, $args:ident| $body:expr) => {
         LValue::NClosure(NClosure::generated(native!(@fn $owner, $args, $body), $generator))
     };
@@ -162,7 +171,62 @@ macro_rules! native {
     };
 }
 
+/// What a file userdata is: the bytes of a file opened for reading, how far it has been read, and
+/// whether it's closed; or the process's standard output or error.
+enum File {
+    Read { bytes: Vec<u8>, at: Cell<usize>, closed: Cell<bool> },
+    Stdout,
+    Stderr,
+}
+
+/// A new file userdata of `file`, with the files' metatable.
+fn file<'s, 'i>(file: File) -> LBoxed<'s, 'i> {
+    let metatable = FILE_METATABLE.with(|m| m.get()).expect("the files' metatable, made with the globals");
+    // SAFETY: only the lifetimes change; `io.stdout` keeps the metatable alive.
+    let metatable = unsafe { std::mem::transmute::<LBoxed<'static, 'static>, LBoxed<'s, 'i>>(metatable) }.as_table();
+    LBoxed::box_lvalue(LValue::Userdata(Tc::new(Userdata::with_data(metatable, file))))
+}
+
+/// Run `f` on the file `v` is, as the method `name`'s first argument, or its error.
+fn with_file<'s, 'i, T>(owner: &crate::Owner, v: LBoxed<'s, 'i>, name: &str, f: impl FnOnce(&File) -> Result<T, LBoxed<'s, 'i>>) -> Result<T, LBoxed<'s, 'i>> {
+    let LValue::Userdata(u) = v.unbox() else { return Err(error_value(format!("bad argument #1 to '{name}' (FILE* expected)"))) };
+    match u.ro(owner).data::<File>() {
+        Some(File::Read { closed, .. }) if closed.get() => Err(error_value("attempt to use a closed file".into())),
+        Some(file) => f(file),
+        None => Err(error_value(format!("bad argument #1 to '{name}' (FILE* expected)"))),
+    }
+}
+
+/// Write `values` as `io.write` does, to `out`.
+fn write_values(out: &mut dyn std::io::Write, values: &[LBoxed<'_, '_>]) {
+    for &v in values {
+        out.write_all(&bytes(&v)).expect("writing output");
+    }
+}
+
+/// `pairs(t)` and `ipairs(t)`'s argument, which must be a table.
+fn iterated<'s, 'i>(args: &[LBoxed<'s, 'i>], name: &str) -> Result<LBoxed<'s, 'i>, LBoxed<'s, 'i>> {
+    let t = arg(args, 0);
+    match t.unbox() {
+        LValue::Table(_) => Ok(t),
+        _ => Err(error_value(format!("bad argument #1 to '{name}' (table expected, got {})", String::from_utf8_lossy(type_name(t))))),
+    }
+}
+
+/// The iterator `pairs` returns, `next`, or `ipairs`'s.
+fn iterator(ipairs: bool) -> NClosure {
+    let (next, ipairs_next) = ITERATORS.with(|iterators| iterators.get()).expect("the iterators, made with the globals");
+    if ipairs { ipairs_next } else { next }
+}
+
 thread_local! {
+    /// `next` and `ipairs`'s iterator, which `pairs` and `ipairs` return: made with the globals.
+    static ITERATORS: Cell<Option<(NClosure, NClosure)>> = const { Cell::new(None) };
+
+    /// The files' metatable, made with the globals, whose `__index` has their methods. Its
+    /// lifetimes are erased; `io.stdout`, which has it, keeps it alive.
+    static FILE_METATABLE: Cell<Option<LBoxed<'static, 'static>>> = const { Cell::new(None) };
+
     /// `math.random`'s state: xorshift64, which `math.randomseed` reseeds.
     static RANDOM: Cell<u64> = const { Cell::new(0x2545_f491_4f6c_dd1d) };
 }
@@ -576,7 +640,13 @@ fn bitn_window<const OP: u8>(a: usize, b: u16, c: u16, ints: &[bool]) -> Option<
 // at the call's pc, as an opcode is by its own, and the code after the call is compiled from the
 // context it ends in. So a native's call can guard its arguments, lay out ops whose results' types
 // hold past a dynamic guard, and fall back to a call of the native itself (`YieldOp::NativeCall`)
-// where none of that applies, all as an opcode's code does. Only a pure native has one.
+// where none of that applies, all as an opcode's code does. That call has the effects any call of
+// the native has (Note [Call effects]).
+//
+// A call inside an instruction, a generic for's of its iterator, of a native the context knows is
+// compiled by the native's generator too, which the instruction drains before going on, as one
+// generator drains another. So `pairs` and `ipairs`, which return an iterator the context then
+// knows, make each step of their loop the iterator's ops rather than a call.
 
 /// A string argument's bytes, which the code running the op has guarded it is.
 #[inline(always)]
@@ -668,7 +738,7 @@ crate::window::windowed!(AbsIntDouble, [], [], |owner, state, base| (x, out r) {
 /// in the encoding an integer op's is, decided the first time it runs, and rebuilt to compute in
 /// doubles once one doesn't fit; of a double, a double; any other call is the native's. See Notes
 /// [Native generators] and [Optimistic ops].
-fn abs_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn abs_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 {
@@ -705,7 +775,7 @@ crate::window::windowed!(select AssertHolds, [], [], |owner, state, base| (condi
 
 /// `assert`'s generator: for a call keeping no results, its condition tested, the native called
 /// only where it fails, to raise; any other call is the native's. See Note [Native generators].
-pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+pub(crate) fn assert_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b >= 2 && c == 1 && (yield YieldOp::OptimisticExec(std::rc::Rc::new(AssertHolds::new(&[a + 1])))) == ResumeArg::Matched {
@@ -720,7 +790,7 @@ pub(crate) fn assert_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c:
 /// result, its result in the encoding an integer op's is, decided the first time it runs, and
 /// rebuilt to compute in doubles once one doesn't fit; any other call is the native's. See Notes
 /// [Native generators] and [Optimistic ops].
-fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn whole_generator<const OP: u8>(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, Fits, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 {
@@ -773,7 +843,7 @@ fn whole_generator<const OP: u8>(nf: crate::vm::NativeFunc, a: usize, b: usize, 
 /// the field loaded into, as it is dead until the result is moved there. Returns `t`; any other
 /// call is the native's, which does too.
 #[cfg(feature = "magic")]
-fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn learn_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c <= 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
@@ -805,7 +875,7 @@ fn learn_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> B
 /// freezes it first: code past it knows which table it is while it stays frozen. Any other call is
 /// the native's. See Note [Frozen tables].
 #[cfg(feature = "magic")]
-fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn frozen_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched
@@ -826,7 +896,7 @@ fn frozen_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> 
 /// with no test, until a store into `t` trips its watchpoint; any other call is the native's. See
 /// Note [Watched tables].
 #[cfg(feature = "magic")]
-fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn tripped_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     crate::window::windowed!(Untripped, [], [], |owner, state, base| (out r) {
         *r = LBoxed::from_bool(false);
@@ -854,7 +924,7 @@ fn tripped_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
 /// be contracted. A test asserts with it that the code it is in isn't duplicated. Any other
 /// call, as one the interpreter runs, is the native's, which returns 0.
 #[cfg(feature = "magic")]
-fn versions_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn versions_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 1 && c == 2 {
@@ -878,7 +948,7 @@ crate::window::windowed!(VersionsK, [n: i32], [], |owner, state, base| (out r) {
 /// narrowed), `v` promoted, its value moved into the result's slot; any other call is the
 /// native's, which returns its argument. See Note [Promoted values].
 #[cfg(feature = "magic")]
-fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn promote_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp, PROMOTE_VALUES};
     Box::new(#[coroutine] move |_: ResumeArg| {
         if b == 2 && c == 2 {
@@ -899,7 +969,7 @@ fn promote_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) ->
     })
 }
 
-fn byte_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+fn byte_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
     use crate::specialize::{CType, ResumeArg, YieldOp};
     use crate::window::Window;
     Box::new(#[coroutine] move |_: ResumeArg| {
@@ -918,6 +988,112 @@ fn byte_generator(nf: crate::vm::NativeFunc, a: usize, b: usize, c: usize) -> Bo
             if (yield YieldOp::GuardDynamic(test)) == ResumeArg::Matched {
                 yield YieldOp::ExecWindow(op);
                 yield YieldOp::SetCTypes((0..4).map(|k| (a + k, CType::Type(if k < n { LType::Integer } else { LType::Nil }))).collect());
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+/// `pairs`'s generator, or with `IPAIRS` `ipairs`'s: for a call of a table keeping up to three
+/// results, the iterator, a constant the code after it knows, the table, and the first control
+/// value. A generic for calling the iterator then compiles its call as the iterator's own (Note
+/// [Native generators]). Any other call is the native's.
+fn pairs_generator<const IPAIRS: bool>(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 2 && (1..=3).contains(&n) && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            let iterator = iterator(IPAIRS);
+            let bits = LBoxed::box_lvalue(LValue::NClosure(iterator)).bits();
+            yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::LoadK::new(bits, &[a])));
+            yield YieldOp::SetCTypes(vec![(a, CType::NativeFunction(iterator))]);
+            if n == 3 {
+                if IPAIRS {
+                    yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::LoadK::new(LBoxed::from_int(0).bits(), &[a + 2])));
+                    yield YieldOp::SetCTypes(vec![(a + 2, CType::Type(LType::Integer))]);
+                } else {
+                    yield YieldOp::ExecWindow(std::rc::Rc::new(crate::generators::LoadNil::new(&[a + 2])));
+                    yield YieldOp::SetCTypes(vec![(a + 2, CType::Type(LType::Nil))]);
+                }
+            }
+            return ResumeArg::Start;
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+// `next(t, k)`'s results to R(A) and R(A+1): the key and value of the entry after `k` in `t`, or
+// nil past the last. Exit 1 for a key `t` lacks, whose error the native's call raises, with R(A+1)
+// `t` again, as that call needs its arguments. `hint`, a cell's address, holds where in the hash
+// part the entry the site last gave back is, which a loop's next step looks for `k` at first.
+crate::window::windowed!(reads select NextEntry, [hint: usize], [], |owner, state, base| (t, k, out key, out value) {
+    let LValue::Table(tab) = t.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
+    let hint = unsafe { &*(hint as *const Cell<usize>) };
+    match tab.ro(owner).next_from(k, hint.get()) {
+        Ok(Some((found, held, at))) => { hint.set(at); (*key, *value) = (found, held); 0 },
+        Ok(None) => { (*key, *value) = (LBoxed::NIL, LBoxed::NIL); 0 },
+        Err(()) => { (*key, *value) = (k, t); 1 },
+    }
+});
+
+/// `next`'s generator: for `next(t, k)` of a table keeping one or two results, `NextEntry` with a
+/// hint of its own, the native called for a key the table lacks. Any other call is the native's.
+fn next_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 3 && (1..=2).contains(&n) && (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched {
+            let ResumeArg::Hint(hint) = (yield YieldOp::Hint) else { unreachable!() };
+            // See Note [Optimistic ops].
+            if (yield YieldOp::OptimisticExec(std::rc::Rc::new(NextEntry::new(hint as usize, &[a + 1, a + 2, a, a + 1])))) == ResumeArg::Matched {
+                yield YieldOp::SetCTypes(vec![(a, CType::Unknown), (a + 1, CType::Unknown)]);
+                return ResumeArg::Start;
+            }
+        }
+        yield YieldOp::NativeCall { nf, a, b, c };
+        ResumeArg::Start
+    })
+}
+
+// `ipairs`'s iterator's results to R(A) and R(A+1) for `t` and the integer `i`: `i + 1` and
+// `t[i + 1]`, raw. Exit 1, with nil in both, where that's nil, past the last. An `i + 1` an i32
+// doesn't hold is past the last too, as no array is that long.
+crate::window::windowed!(reads select IpairsEntry, [], [], |owner, state, base, tag| (t, i, out key, out value) {
+    let LValue::Table(tab) = t.unbox() else { unsafe { core::hint::unreachable_unchecked() } };
+    let found = unsafe { i.as_int() }.checked_add(1).and_then(|at| {
+        let v = tab.ro(owner).array.get(at as usize - 1).copied().filter(|v| !v.is_nil())?;
+        Some((at, v))
+    });
+    match found {
+        Some((at, v)) => { (*key, *value) = (LBoxed::from_int_tagged(at, tag), v); 0 },
+        None => { (*key, *value) = (LBoxed::NIL, LBoxed::NIL); 1 },
+    }
+});
+
+/// `ipairs`'s iterator's generator: for a call of a table and an integer keeping one or two
+/// results, `IpairsEntry`, the key's type known on each of its ways, so a generic for's test of it
+/// is too, and the value an element of the table's array part. Any other call is the native's.
+fn ipairs_next_generator(nf: NClosure, a: usize, b: usize, c: usize) -> Box<dyn crate::specialize::NativeGen> {
+    use crate::specialize::{CType, ResumeArg, YieldOp};
+    Box::new(#[coroutine] move |_: ResumeArg| {
+        let n = c.wrapping_sub(1);
+        if b == 3 && (1..=2).contains(&n) {
+            yield YieldOp::Narrow(a + 2);
+            if (yield YieldOp::Guard(a + 1, LType::Table)) == ResumeArg::Matched && (yield YieldOp::Guard(a + 2, LType::Integer)) == ResumeArg::Matched {
+                // Where the table is, asked before its value overwrites its slot.
+                let ResumeArg::Subject(table) = (yield YieldOp::Subject(a + 1)) else { unreachable!() };
+                // See Note [Optimistic ops].
+                if (yield YieldOp::OptimisticExec(std::rc::Rc::new(IpairsEntry::new(&[a + 1, a + 2, a, a + 1])))) == ResumeArg::Matched {
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
+                    // An element of the table's array part, its type the array's kind. See Note
+                    // [Array kinds].
+                    yield YieldOp::ArrayType(a + 1, table);
+                } else {
+                    yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Nil)), (a + 1, CType::Type(LType::Nil))]);
+                }
                 return ResumeArg::Start;
             }
         }
@@ -1126,14 +1302,85 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         })),
     ]);
 
+    // A file's methods, which read and close change it, so they aren't pure. `lines` is the
+    // prelude's.
+    let file_methods = module(intern, vec![
+        // `f:read(formats...)`: for each, "*a" the rest, "*l" the next line without its newline, or
+        // a count that many bytes at most; nil past the end, after which no format reads.
+        ("read", native!(|owner, args| {
+            with_file(owner, arg(&args, 0), "read", |file| {
+                let File::Read { bytes, at, .. } = file else { return Err(error_value("file not opened for reading".into())) };
+                let formats = if args.len() > 1 { args[1..].to_vec() } else { vec![string(b"*l".to_vec())] };
+                let mut results = vec![];
+                for format in formats {
+                    let rest = &bytes[at.get()..];
+                    let spec = String::from_utf8_lossy(&self::bytes(&format)).trim_start_matches('*').chars().next();
+                    let read = match format.as_number() {
+                        Some(n) => (n as usize > 0 || !rest.is_empty()).then(|| rest[..(n as usize).min(rest.len())].to_vec()).filter(|read| !read.is_empty() || n as usize == 0),
+                        None => match spec {
+                            Some('a') => Some(rest.to_vec()),
+                            Some('l') => (!rest.is_empty()).then(|| {
+                                let line = rest.iter().position(|&b| b == b'\n').map_or(rest, |end| &rest[..end]);
+                                line.to_vec()
+                            }),
+                            _ => return Err(error_value("bad argument #1 to 'read' (invalid format)".into())),
+                        },
+                    };
+                    let Some(read) = read else {
+                        results.push(LBoxed::NIL);
+                        break;
+                    };
+                    // A line's newline is read with it.
+                    let newline = spec == Some('l') && format.as_number().is_none() && at.get() + read.len() < bytes.len();
+                    at.set(at.get() + read.len() + usize::from(newline));
+                    results.push(string(read));
+                }
+                Ok(results)
+            })?
+        })),
+        ("close", native!(|owner, args| {
+            with_file(owner, arg(&args, 0), "close", |file| match file {
+                File::Read { closed, .. } => { closed.set(true); Ok(vec![LBoxed::from_bool(true)]) },
+                File::Stdout | File::Stderr => Ok(vec![LBoxed::NIL, string(b"cannot close standard file".to_vec())]),
+            })?
+        })),
+        // `f:write(values...)`: true, as Lua 5.1's, once written.
+        ("write", native!(|owner, args| {
+            with_file(owner, arg(&args, 0), "write", |file| match file {
+                File::Stdout => { write_values(&mut std::io::stdout().lock(), &args[1..]); Ok(vec![LBoxed::from_bool(true)]) },
+                File::Stderr => { write_values(&mut std::io::stderr().lock(), &args[1..]); Ok(vec![LBoxed::from_bool(true)]) },
+                File::Read { .. } => Ok(vec![LBoxed::NIL, string(b"file not opened for writing".to_vec())]),
+            })?
+        })),
+    ]);
+    let file_metatable = module(intern, vec![("__index", file_methods)]);
+    // SAFETY: only the lifetimes change; see `FILE_METATABLE`.
+    FILE_METATABLE.with(|m| m.set(Some(unsafe { std::mem::transmute::<LBoxed<'s, 'i>, LBoxed<'static, 'static>>(LBoxed::box_lvalue(file_metatable.clone())) })));
     let io_lib = module(intern, vec![
         ("write", native!(pure |owner, args| {
-            let mut out = std::io::stdout().lock();
-            for &v in args {
-                out.write_all(&bytes(&v)).expect("writing stdout");
-            }
+            write_values(&mut std::io::stdout().lock(), args);
             vec![]
         })),
+        // Lua's `io.open(path, mode)`: a file opened for reading, read whole as it opens. Writing
+        // isn't supported: any other mode, like a file that can't be read, is nil and why.
+        ("open", native!(pure |owner, args| {
+            let path = String::from_utf8_lossy(&arg_bytes(&args, 0)).into_owned();
+            let mode = if args.len() > 1 && !arg(&args, 1).is_nil() { arg_bytes(&args, 1).into_owned() } else { b"r".to_vec() };
+            if mode.iter().any(|&c| matches!(c, b'w' | b'a' | b'+')) {
+                vec![LBoxed::NIL, string(format!("{path}: writing files is not supported").into_bytes())]
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => vec![file(File::Read { bytes, at: Cell::new(0), closed: Cell::new(false) })],
+                    Err(e) => {
+                        let code = e.raw_os_error().unwrap_or(0);
+                        let why = unsafe { std::ffi::CStr::from_ptr(libc::strerror(code)) }.to_string_lossy().into_owned();
+                        vec![LBoxed::NIL, string(format!("{path}: {why}").into_bytes()), LBoxed::from_int(code)]
+                    }
+                }
+            }
+        })),
+        ("stdout", file(File::Stdout).unbox()),
+        ("stderr", file(File::Stderr).unbox()),
         // The benchmarks' `io.write` that discards its output.
         ("write_devnull", native!(pure |owner, args| vec![])),
     ]);
@@ -1161,12 +1408,38 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (i..=j).map(|k| if k >= 1 { array.get(k as usize - 1).copied().unwrap_or(LBoxed::NIL) } else { LBoxed::NIL }).collect()
     });
     // Lua's `next(t, k)`: the entry after key `k`'s, or the first, for nil; nil past the last.
-    let next = native!(pure |owner, args| {
+    let next = native!(pure generator: next_generator, |owner, args| {
         match table(arg(&args, 0)).ro(owner).next(arg(&args, 1)) {
             Ok(Some((key, value))) => vec![key, value],
             Ok(None) => vec![LBoxed::NIL],
             Err(()) => return Err(error_value("invalid key to 'next'".into())),
         }
+    });
+    // `ipairs`'s iterator: `i + 1` and `t[i + 1]`, raw, or nothing past the last.
+    let ipairs_next = native!(pure generator: ipairs_next_generator, |owner, args| {
+        let i = number(arg(&args, 1)) + 1.0;
+        match table(arg(&args, 0)).get_number(owner, i) {
+            v if v.is_nil() => vec![],
+            v => vec![LBoxed::from_number(i), v],
+        }
+    });
+    let (LValue::NClosure(next_nf), LValue::NClosure(ipairs_nf)) = (&next, &ipairs_next) else { unreachable!("natives") };
+    ITERATORS.with(|iterators| iterators.set(Some((*next_nf, *ipairs_nf))));
+    // Lua's `rawget(t, k)`: `t[k]`, not looked for in its metatable. `rawset` is the prelude's.
+    let rawget = native!(pure |owner, args| {
+        let LValue::Table(t) = arg(&args, 0).unbox() else {
+            return Err(error_value(format!("bad argument #1 to 'rawget' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
+        };
+        vec![t.get_raw(owner, arg(&args, 1))]
+    });
+    // Lua's `pairs(t)` and `ipairs(t)`: an iterator, `t`, and its first control value.
+    let pairs = native!(pure generator: pairs_generator::<false>, |owner, args| {
+        let t = iterated(&args, "pairs")?;
+        vec![LBoxed::box_lvalue(LValue::NClosure(iterator(false))), t, LBoxed::NIL]
+    });
+    let ipairs = native!(pure generator: pairs_generator::<true>, |owner, args| {
+        let t = iterated(&args, "ipairs")?;
+        vec![LBoxed::box_lvalue(LValue::NClosure(iterator(true))), t, LBoxed::from_int(0)]
     });
     // Lua's `select(n, ...)`: its arguments from the `n`th, or with "#" how many.
     let select = native!(pure |owner, args| {
@@ -1199,7 +1472,7 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     });
     // Lua's `setmetatable(t, mt)` on a table: its metatable changes, which moves it
     // to a new epoch. See Note [Table metatables].
-    let setmetatable = native!(|owner, args| {
+    let setmetatable = native!(returns: 0, |owner, args| {
         let Some(t) = arg(&args, 0).as_table() else {
             return Err(error_value(format!("bad argument #1 to 'setmetatable' (table expected, got {})", String::from_utf8_lossy(type_name(arg(&args, 0))))));
         };
@@ -1266,21 +1539,28 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
     // in a Lua other than LuaJIT, and code probing for it runs without. `jit.versions()`: how many
     // versions the code it is in has (`versions_generator`), for tests.
     #[cfg(feature = "magic")]
-    let jit_lib = module(intern, vec![
-        ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
-        ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
-        ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
+    let jit_lib = {
+        #[allow(unused_mut)]
+        let mut natives = vec![
+            ("promote", native!(pure generator: promote_generator, |owner, args| vec![arg(&args, 0)])),
+            ("versions", native!(pure generator: versions_generator, |owner, args| vec![LBoxed::from_int(0)])),
+            ("learn", native!(pure generator: learn_generator, |owner, args| vec![arg(&args, 0)])),
+        ];
         // `jit.frozen(t)`: `t`, frozen; `jit.tripped(t)`: whether a store into it tripped its
         // watchpoint since, for tests. See Notes [Frozen tables] and [Watched tables].
-        ("frozen", native!(generator: frozen_generator, |owner, args| {
-            let t = table(arg(&args, 0));
-            t.rw(owner).watched = true;
-            vec![arg(&args, 0)]
-        })),
-        ("tripped", native!(pure generator: tripped_generator, |owner, args| {
-            vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
-        })),
-    ]);
+        #[cfg(feature = "watchpoints")]
+        natives.extend([
+            ("frozen", native!(generator: frozen_generator, |owner, args| {
+                let t = table(arg(&args, 0));
+                t.rw(owner).watched = true;
+                vec![arg(&args, 0)]
+            })),
+            ("tripped", native!(pure generator: tripped_generator, |owner, args| {
+                vec![LBoxed::from_bool(!table(arg(&args, 0)).ro(owner).watched)]
+            })),
+        ]);
+        module(intern, natives)
+    };
 
     MODULES.with_borrow_mut(|modules| {
         *modules = vec![("bit", erase(&bit_lib)), ("table.new", erase(&table_new)), ("table.clear", erase(&table_clear))];
@@ -1293,6 +1573,9 @@ pub fn globals<'s, 'i>(intern: &'i internment::Arena<IStr<'s>>) -> Vec<(LValue<'
         (InternString::intern(intern, "require"), require),
         (InternString::intern(intern, "unpack"), unpack),
         (InternString::intern(intern, "next"), next),
+        (InternString::intern(intern, "rawget"), rawget),
+        (InternString::intern(intern, "pairs"), pairs),
+        (InternString::intern(intern, "ipairs"), ipairs),
         (InternString::intern(intern, "select"), select),
         (InternString::intern(intern, "error"), error),
         (InternString::intern(intern, "pcall"), pcall),

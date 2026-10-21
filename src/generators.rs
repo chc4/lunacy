@@ -361,9 +361,9 @@ pub fn emit_setglobal(src: usize, k: usize) -> impl Coroutine<ResumeArg, Yield =
         // A watched environment trips first. See Note [Watched tables].
         yield YieldOp::Trip(None);
         let ResumeArg::Cache(cache) = (yield YieldOp::GlobalCache(k)) else { unreachable!() };
-        // A store to `__index` moves the environment to a new epoch, as only the
+        // A store to a metamethod moves the environment to a new epoch, as only the
         // generic store does. See Note [Table metatables].
-        arg = if (yield YieldOp::IsKey(k, b"__index")) == ResumeArg::Matched {
+        arg = if (yield YieldOp::IsMetamethod(k)) == ResumeArg::Matched {
             let cache = cache as usize;
             yield YieldOp::Exec(ResidualExec::new("setglobal_index", Rc::new(move |owner, state| {
                 let value = state.vals[state.base + src];
@@ -932,9 +932,9 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                 // A number stored into a field that has held both encodings goes in as a double.
                 let to_double = c & 0x100 == 0 && htype == CType::Number && matches!(value_type, CType::Number | CType::Type(LType::Integer));
                 let new_type = if whole.is_some() { Some(LType::Integer) } else if to_double { Some(LType::Double) } else { value_type.as_ltype() };
-                // A store to `__index` moves the table to a new epoch, whatever it
+                // A store to a metamethod moves the table to a new epoch, whatever it
                 // stores. See Note [Table metatables].
-                let index = b & 0x100 != 0 && (yield YieldOp::IsKey(b & 0xff, b"__index")) == ResumeArg::Matched;
+                let index = b & 0x100 != 0 && (yield YieldOp::IsMetamethod(b & 0xff)) == ResumeArg::Matched;
                 let retype = match retype(new_type, &htype) {
                     Retype::Same if index => Retype::Known,
                     retype => retype,
@@ -990,9 +990,11 @@ pub fn emit_settable(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, 
                     let LValue::Table(t) = state.vals[state.base + a].unbox() else { unreachable!() };
                     // A field's type is a number's encoding. See Note [Field types].
                     let kc_type = kc.unbox().typeof_();
+                    let metamethod = crate::vm::is_metamethod(kb.boxed());
                     if let Some(existing) = t.rw(owner).insert_hash(kb, kc) {
                         info!("settable_hash with existing key {:?} {:?}", &existing, kc);
-                        if existing.unbox().typeof_() != kc_type {
+                        // See Note [Table metatables].
+                        if existing.unbox().typeof_() != kc_type || metamethod {
                             t.rw(owner).epoch += 1;
                         }
                     } else {
@@ -1054,8 +1056,10 @@ pub fn emit_setlist(a: usize, b: usize, c: usize) -> impl Coroutine<ResumeArg, Y
                 },
                 _ => unreachable!(),
             };
-        })));
+        })).writing(&[]));
         yield YieldOp::SetTypes(vec![(a, LType::Table)]);
+        // See Note [Call effects].
+        yield YieldOp::Effect(Effect::ArrayStore(None));
         arg
     }
 }
@@ -1388,17 +1392,6 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
                 },
             }
         }
-        arg = yield YieldOp::GuardRk(lhs, LType::Table);
-        if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
-            arg = yield YieldOp::GuardRk(rhs, LType::Table);
-            if let ResumeArg::Matched | ResumeArg::MatchedConst(_) = arg {
-                yield YieldOp::Exec(ResidualExec::new("numeric_table_table", Rc::new(move |owner, state| {
-                    panic!();
-                })));
-                yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
-                return arg;
-            }
-        }
         // --- Number Path ---
         // Each register decoded from the encoding it is in. See Note [Integers].
         let larg = yield YieldOp::GuardCType(lhs, CType::Number);
@@ -1509,12 +1502,100 @@ pub fn emit_numeric(opcode: Opcode, dest: usize, lhs: usize, rhs: usize) -> impl
             debug!("fail 1");
         }
 
-        // --- Generic/Trap Fallback ---
-        //panic!("Type mismatch trap");
-        arg = yield YieldOp::Typeof(lhs);
-        arg = yield YieldOp::Exec(ResidualExec::new("numeric_fail", Rc::new(move |owner, state| {
-            panic!("numeric runtime type mismatch {:?} {:?}", arg, &state.vals)
+        // Operands that aren't both numbers: a metamethod's. See Note [Arithmetic metamethods].
+        let event: &'static [u8] = match opcode {
+            Opcode::ADD => b"__add",
+            Opcode::SUB => b"__sub",
+            Opcode::MUL => b"__mul",
+            Opcode::DIV => b"__div",
+            Opcode::MOD => b"__mod",
+            Opcode::POW => b"__pow",
+            _ => unreachable!("an arithmetic opcode: {opcode:?}"),
+        };
+        let mut metamethod = emit_metamethod(Metamethod::Arith(event), dest, lhs, Some(rhs));
+        drain!(metamethod, arg);
+        ResumeArg::Start
+    }
+}
+
+/// The instruction a metamethod is called for. See Note [Arithmetic metamethods].
+#[derive(Clone, Copy)]
+enum Metamethod {
+    /// Arithmetic, of this event, whose handler a table or a userdata may have.
+    Arith(&'static [u8]),
+    /// LEN, whose handler only a userdata has: a table's length is its own.
+    Len,
+}
+
+/// An instruction of RK(`lhs`) and RK(`rhs`), or nil, that `kind` calls a metamethod for: the
+/// handler of the left one's metatable, else the right one's, called on both, its result into
+/// R(`dest`). With neither, the error Lua raises. See Note [Arithmetic metamethods].
+fn emit_metamethod(kind: Metamethod, dest: usize, lhs: usize, rhs: Option<usize>) -> impl Coroutine<ResumeArg, Yield = YieldOp, Return = ResumeArg> + Clone + Unpin {
+    #[coroutine]
+    move |mut arg: ResumeArg| {
+        let event: &'static [u8] = match kind {
+            Metamethod::Arith(event) => event,
+            Metamethod::Len => b"__len",
+        };
+        for operand in [Some(lhs), rhs].into_iter().flatten() {
+            // A metatable only a table or a userdata has.
+            if operand & 0x100 != 0 {
+                continue;
+            }
+            let table = matches!(kind, Metamethod::Arith(_)) && (yield YieldOp::Guard(operand, LType::Table)) == ResumeArg::Matched;
+            if !table && (yield YieldOp::Guard(operand, LType::Userdata)) != ResumeArg::Matched {
+                continue;
+            }
+            let ResumeArg::HashRef(handler, _) = (yield YieldOp::MetaKey(operand, event)) else { continue };
+            // The handler and its operands past the frame's registers, as a call's.
+            let ResumeArg::Integer(f) = (yield YieldOp::Reserve(3)) else { unreachable!() };
+            let f = f as usize;
+            yield YieldOp::ExecWindow(Rc::new(GetTableHref::new(handler.0, &[f])));
+            yield YieldOp::FieldType(f, handler);
+            for (to, from) in [(f + 1, Some(lhs)), (f + 2, rhs)] {
+                let Some(from) = from else {
+                    yield YieldOp::ExecWindow(Rc::new(LoadNil::new(&[to])));
+                    yield YieldOp::SetCTypes(vec![(to, CType::Type(LType::Nil))]);
+                    continue;
+                };
+                if from & 0x100 != 0 {
+                    let ResumeArg::Boxed(bits) = (yield YieldOp::BoxedK(from & 0xff)) else { unreachable!() };
+                    let ResumeArg::Type(t) = (yield YieldOp::TypeofRk(from)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(LoadK::new(bits, &[to])));
+                    yield YieldOp::SetCTypes(vec![(to, t)]);
+                } else {
+                    let ResumeArg::Type(t) = (yield YieldOp::Typeof(from)) else { unreachable!() };
+                    yield YieldOp::ExecWindow(Rc::new(Move::new(&[from, to])));
+                    yield YieldOp::SetCTypes(vec![(to, t)]);
+                    yield YieldOp::Copy(to, from);
+                }
+            }
+            yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, 2));
+            let ResumeArg::Type(t) = (yield YieldOp::Typeof(f)) else { unreachable!() };
+            yield YieldOp::ExecWindow(Rc::new(Move::new(&[f, dest])));
+            yield YieldOp::SetCTypes(vec![(dest, t)]);
+            yield YieldOp::Copy(dest, f);
+            yield YieldOp::Release(f);
+            return arg;
+        }
+        arg = yield YieldOp::Exec(ResidualExec::new("metamethod_error", Rc::new(move |owner, state| {
+            let value = |rk: usize| match Vm::rk(state.clos.ro(owner).prototype, state.base, &state.vals, rk as u16) {
+                Ok(k) => LBoxed::from(k),
+                Err(v) => *v,
+            };
+            // The operand named is the left one, unless it's a number.
+            let culprit = match (value(lhs), rhs) {
+                (v, Some(rhs)) if v.as_number().is_some() => value(rhs),
+                (v, _) => v,
+            };
+            let name = String::from_utf8_lossy(crate::library::type_name(culprit));
+            let message = match kind {
+                Metamethod::Arith(_) => format!("attempt to perform arithmetic on a {name} value"),
+                Metamethod::Len => format!("attempt to get length of a {name} value"),
+            };
+            state.raise(LBoxed::box_lvalue(LValue::OwnedString(crate::gc::Gc::string(message.as_bytes()))));
         })));
+        yield YieldOp::SetCTypes(vec![(dest, CType::Unknown)]);
         arg
     }
 }
@@ -1869,8 +1950,12 @@ pub fn emit_unm(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
     #[coroutine]
     move |mut arg: ResumeArg| {
         arg = yield YieldOp::GuardCType(b, CType::Number);
+        // A metamethod's, called on the operand twice, as Lua's is. See Note [Arithmetic
+        // metamethods].
         let (ResumeArg::Matched | ResumeArg::MatchedConst(_)) = arg else {
-            unimplemented!("__unm metatable");
+            let mut metamethod = emit_metamethod(Metamethod::Arith(b"__unm"), a, b, Some(b));
+            drain!(metamethod, arg);
+            return ResumeArg::Start;
         };
         arg = yield YieldOp::Exec(ResidualExec::new("unm", Rc::new(move |owner, state| {
             let res = match state.vals[state.base + b as usize].unbox() {
@@ -1904,7 +1989,6 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
         }
         arg = yield YieldOp::Guard(b, LType::Table);
         if ResumeArg::Matched == arg {
-            // TODO: __len metamethod
             arg = yield YieldOp::Exec(ResidualExec::new("len_tab", Rc::new(move |owner, state| {
                 let LValue::Table(b) = state.vals[state.base + b].unbox() else { unreachable!() };
                 let n = b.ro(owner).array.len();
@@ -1913,11 +1997,12 @@ pub fn emit_len(a: usize, b: usize) -> impl Coroutine<ResumeArg, Yield = YieldOp
             // A length, an integer. See Note [Integers].
             yield YieldOp::SetCTypes(vec![(a, CType::Type(LType::Integer))]);
             return arg;
-        } else {
-            unimplemented!("__len metamethod")
         }
-
-        arg
+        // Any other's is a metamethod's, called with nil after it, as Lua's is. See Note
+        // [Arithmetic metamethods].
+        let mut metamethod = emit_metamethod(Metamethod::Len, a, b, None);
+        drain!(metamethod, arg);
+        ResumeArg::Start
     }
 }
 
@@ -2473,7 +2558,16 @@ pub fn emit_tforloop(a: usize, c: usize, pc: usize) -> impl Coroutine<ResumeArg,
                 yield YieldOp::GuardCType(slot, args.clone());
             }
         }
-        yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, c + 1));
+        // A native iterator the context knows compiles its call itself. See Note [Native
+        // generators].
+        let native = match (yield YieldOp::Typeof(f)) {
+            ResumeArg::Type(CType::NativeFunction(nf)) if !nf.is_protected_call() => nf.generator().map(|generator| generator(nf, f, 3, c + 1)),
+            _ => None,
+        };
+        match native {
+            Some(mut call) => { drain!(call, arg); }
+            None => arg = yield YieldOp::CallResume(CallTarget::Dynamic(f, 3, c + 1)),
+        }
         arg = yield YieldOp::Guard(f, LType::Nil);
         if arg == ResumeArg::Matched {
             arg = yield YieldOp::GetBlock(pc + 1);

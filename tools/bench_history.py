@@ -28,6 +28,10 @@ hyperfine exports they came from.
 (bench/jit_sizes.jsonl), keyed as the times are: every byte of code the JIT
 committed, from the section headers of the run's annotated disassembly (`just
 jit-disasm`, working/jit_disasm.txt), which the unsafe build commits the same.
+
+Both record the `rustc --version` of the toolchain on PATH (`rustc`), which built
+what they ran: the devshell follows the rolling nightly, so one commit's times
+and sizes may come from several compilers.
 """
 import argparse
 import datetime
@@ -118,8 +122,17 @@ def load(path=HISTORY):
         return [json.loads(line) for line in f if line.strip()]
 
 
+def rustc_version():
+    """The `rustc --version` of the toolchain on PATH, or None if there is none."""
+    try:
+        return subprocess.run(['rustc', '--version'], capture_output=True, text=True, check=True).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+
 def record(args):
     head, dirty = head_state()
+    rustc = rustc_version()
     ref = commit_info(args.ref)[0] if args.ref else None
     results = hyperfine_json.results(args.json)
     now = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds')
@@ -153,7 +166,7 @@ def record(args):
             'date': now, 'commit': commit, 'dirty': is_dirty,
             'benchmark': args.benchmark, 'arg': args.arg, 'build': build,
             'mean': r['mean'], 'stddev': r['stddev'], 'median': r['median'],
-            'min': r['min'], 'max': r['max'], 'runs': len(times), 'times': times,
+            'min': r['min'], 'max': r['max'], 'runs': len(times), 'times': times, 'rustc': rustc,
         })
     for (commit, is_dirty, build), paddings in padded.items():
         times = [t for runs in paddings.values() for t in runs]
@@ -162,6 +175,7 @@ def record(args):
             'benchmark': args.benchmark, 'arg': args.arg, 'build': build,
             'mean': statistics.mean(times), 'stddev': statistics.stdev(times), 'median': statistics.median(times),
             'min': min(times), 'max': max(times), 'runs': len(times), 'times': times, 'paddings': paddings,
+            'rustc': rustc,
         })
     os.makedirs(os.path.dirname(HISTORY), exist_ok=True)
     with open(HISTORY, 'a') as f:
@@ -180,7 +194,7 @@ def record_size(args):
     line = {
         'date': datetime.datetime.now(datetime.timezone.utc).isoformat(timespec='seconds'),
         'commit': head, 'dirty': dirty, 'benchmark': args.benchmark, 'arg': args.arg,
-        'build': 'unsafe', 'bytes': sum(sections), 'sections': len(sections),
+        'build': 'unsafe', 'bytes': sum(sections), 'sections': len(sections), 'rustc': rustc_version(),
     }
     os.makedirs(os.path.dirname(SIZES), exist_ok=True)
     with open(SIZES, 'a') as f:

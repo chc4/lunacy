@@ -36,17 +36,22 @@ unit filter:
 # Run lunacy against the golden testcases
 [env("RUST_BACKTRACE","1")]
 test:
+    # The interpreter-only build, without the JIT, as `interpreter-compile` builds it, compiles
+    {{SHARED}} cargo check --no-default-features --features "{{INTERPRETER_FEATURES}}" --bin bench --bin lunacy --target-dir ./target/interpreter
     # GC correctness tests
     {{SHARED}} cargo test "gc::" --features "gc_test,gc_sanitize" -- --test-threads 1
     # Normal interpreter tests
     {{SHARED}} cargo test --features "gc_sanitize"
     # Interpreter GC stress test
     {{SHARED}} cargo test --features "gc_stress gc_sanitize"
+    just golden-watchpoints
     # Heap reset frees (no leak); needs the real finalizer, so runs without gc_sanitize
     {{SHARED}} cargo test --test gc_reset_frees
     # The golden tests with random gas, a new seed each time, which a failure prints to
     # rerun it with (`just golden-gas <seed>`)
     just golden-gas
+    # The golden tests with an effect at a random yield (`just golden-conservative <seed>`)
+    just golden-conservative
 
 # Copy&patch window stencils (src/window.rs) as the JIT will use them: built
 # in release, so the stencils checked are the ones the JIT copies (a build
@@ -176,6 +181,10 @@ golden-versions-rev ref +names:
 # The named golden tests (lua_tests/<name>.lua), each against its expected
 # output, in one debug build with `test`'s golden suite's features: quicker than
 # the whole suite while iterating.
+# The watchpoint tests, which need their feature (Note [Watched tables]).
+golden-watchpoints:
+    LUNACY_GOLDEN=watch,frozen,frozen_alias,unwatched {{SHARED}} cargo test --features "gc_sanitize watchpoints" --test golden_tests test_golden
+
 golden +names:
     LUNACY_GOLDEN={{replace(names, " ", ",")}} {{SHARED}} cargo test --features gc_sanitize --test golden_tests test_golden
 
@@ -193,6 +202,25 @@ golden-gas seed='':
     LUNACY_GOLDEN_GAS_SEED=$seed {{SHARED}} cargo test --features "gc_sanitize gas" --test golden_tests test_golden -- --nocapture > working/golden-gas.log 2>&1 || status=$?
     grep -E "panicked|ran past|test result|mismatch" -B1 working/golden-gas.log | grep -v "^--" | tail -n 20
     exit $status
+
+# The golden tests with an effect applied at a random yield of the specializer's, a new seed each
+# time, which a failure prints to rerun it with (`just golden-conservative <seed>`): code that
+# forgets what it knows must give the same output. See Note [Conservative information].
+golden-conservative seed='':
+    #!/usr/bin/env bash
+    set -euo pipefail
+    seed="{{seed}}"
+    [ -n "$seed" ] || seed=$RANDOM$RANDOM
+    echo "seed $seed"
+    status=0
+    LUNACY_GOLDEN_EFFECT_SEED=$seed {{SHARED}} cargo test --features "gc_sanitize conservative_information" --test golden_tests test_golden -- --nocapture > working/golden-conservative.log 2>&1 || status=$?
+    grep -E "panicked|ran past|test result|mismatch" -B1 working/golden-conservative.log | grep -v "^--" | tail -n 20
+    exit $status
+
+# Golden tests `names`, each run with an effect at each of its specializer's yields in turn,
+# failing with how many of those runs fail. See Note [Conservative information].
+golden-conservative-every +names:
+    LUNACY_GOLDEN={{replace(names, " ", ",")}} LUNACY_GOLDEN_EFFECT_EVERY=1 {{SHARED}} cargo test --features "gc_sanitize conservative_information" --test golden_tests test_golden -- --nocapture 2>&1 | grep -E "yields fail|panicked|test result"
 
 # Golden tests, each against its expected output, under the default build,
 # immediate_jit, no_dynamic_guards and both (tools/golden_builds.py).
@@ -645,6 +673,19 @@ flamegraph benchmark times='10' ref='' freq='997' features='unsafe perf':
         svg=$(realpath working)/flamegraph-{{ref}}.svg
         (cd $dir && {{SAMPLED}} cargo flamegraph -c "record -F {{freq}} --call-graph fp -g" --profile flamegraph --no-default-features --features "{{features}}" --bin bench -o $svg -- $bin {{times}})
     fi
+
+# Each of `profiles` (perf.data files, as `flamegraph` records them) by what spent its cycles
+# (tools/perf_components.py): JIT code, the specializer, the JIT compiler, the collector and
+# allocator, the rest of the runtime; with two, the difference.
+perf-components +profiles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    reports=()
+    for profile in {{profiles}}; do
+        perf report -i $profile --no-children -g none --no-inline --sort dso,sym --stdio -n --percent-limit 0 2>/dev/null > $profile.components.txt
+        reports+=($profile.components.txt)
+    done
+    python3 tools/perf_components.py "${reports[@]}"
 
 # `flamegraph` of revision `ref` (as for `hyperfine-vs`) and of this checkout on
 # one benchmark, kept side by side in working/: flamegraph-<benchmark>-<ref>.svg
@@ -1174,6 +1215,13 @@ bench-history:
     python3 tools/bench_history.py report
     python3 tools/bench_history.py plot
 
+# The library names each of `benchmarks` uses that lunacy's library lacks: globals, and members
+# of its tables such as `string.rep` (tools/library_gaps.py).
+library-gaps +benchmarks:
+    {{SHARED}} cargo build --release --bin lunacy
+    for b in {{benchmarks}}; do just _luac $b > /dev/null; done
+    python3 tools/library_gaps.py target/release/lunacy {{prepend("working/", append(".lua", benchmarks))}}
+
 # What stops each benchmark of lua_benchmarking that HYPERFINES doesn't run:
 # each run once at its scaling under LuaJIT and lunacy's release build (the
 # unsafe build's panics have no message), with how each ended and its error
@@ -1228,7 +1276,7 @@ hyperfine-unsafe benchmark: unsafe-compile
 # The benchmarks lunacy runs, as `benchmark:times`, each run enough times for a
 # stable mean; life twice, as for `hyperfines-traces`. euler14's count is the
 # bound of its search.
-HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140 heapsort:100000 jsonlua_encode:10 deltablue:4000 havlak:1 ray:50 richards:10 collisiondetector:35"
+HYPERFINES := "life:1000 life:5000 nbody:10 queens:3000 fannkuch_redux:150 euler14:1000000 nsieve_bit:10 nsieve:9 binarytrees:2 partialsums:2000000 series:2 mandelbrot:1000 mandelbrot_bit:1000 array3d:120 quicksort:300000 table_cmpsort:100000 recursive_fib:35 recursive_ack:10 spectralnorm:2 bounce:30000 md5:140 heapsort:100000 jsonlua_encode:10 deltablue:4000 havlak:1 ray:50 richards:10 collisiondetector:35 knucleotide:1 jsonlua_decode:200"
 
 # Which benchmarks lunacy runs (tools/bench_runs.py): each of lua_benchmarking's,
 # or those named, at `fraction` of its benchinfo.json scaling, against LuaJIT, in
@@ -1360,6 +1408,24 @@ hyperfines-knob knob: unsafe-compile
     rm -rf working/knob && mkdir -p working/knob
     for run in {{HYPERFINES}}; do b=${run%:*}; t=${run#*:}; just _luac $b; {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/knob/$b-$t.json -n default "./target/unsafe/bench working/$b.bin $t" -n "{{knob}}" "env {{knob}} ./target/unsafe/bench working/$b.bin $t" || echo "skipped $b $t"; done
     python3 tools/knob_table.py working/knob/*.json
+
+# Every HYPERFINES run in the unsafe build with each of `knobs`, environment
+# assignments joined by commas (`LUNACY_SEAL_BUDGET=0,LUNACY_NO_GIVE_UP=1`), and
+# each one's median against the first's (tools/knob_table.py); a run that fails
+# is skipped. Its json in working/knobs/.
+hyperfines-knobs +knobs: unsafe-compile
+    #!/usr/bin/env bash
+    set -euo pipefail
+    rm -rf working/knobs && mkdir -p working/knobs
+    for run in {{HYPERFINES}}; do
+        b=${run%:*}; t=${run#*:}
+        just _luac $b
+        python3 tools/clock_check.py
+        commands=()
+        for knob in {{knobs}}; do commands+=(-n "$knob" "env ${knob//,/ } ./target/unsafe/bench working/$b.bin $t"); done
+        {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-json working/knobs/$b-$t.json "${commands[@]}" || echo "skipped $b $t"
+    done
+    python3 tools/knob_table.py working/knobs/*.json
 
 # Every HYPERFINES run in the unsafe build without and with cargo feature
 # `feature` (built into target/feature-<feature>), and the change in each's

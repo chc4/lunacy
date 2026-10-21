@@ -142,8 +142,8 @@ pub fn get_ptr_from_closure(f: &dyn for <'a, 'b, 'src, 'intern> Fn(&mut Owner, &
     }
 }
 
-// Note [Thunk patching]
-// ~~~~~~~~~~~~~~~~~~~~~
+// Note [Thunk stitching]
+// ~~~~~~~~~~~~~~~~~~~~~~
 // A thunk compiled into JIT code exits to the interpreter, which forces it,
 // but forcing rewrites residuals, not JIT code: a thunk forced after its block
 // was compiled would exit there every time, and a side exit taken often would
@@ -297,12 +297,12 @@ impl JitHelper {
         }
     }
 
-    /// `RunState::own_frame`, of the frame an inlined call's code made a call's. See Note [Sealed
-    /// inlined calls].
-    pub unsafe extern "C" fn own_frame(state: *mut ()) {
+    /// `RunState::own_frame`, of the frame an inlined call's code made a call's, its `len`
+    /// witnesses' moves at `witnesses`. See Note [Sealed inlined calls].
+    pub unsafe extern "C" fn own_frame(state: *mut (), witnesses: *const (u8, u8), len: usize) {
         unsafe {
             let state = &mut *(state as *mut RunState<'static, 'static>);
-            state.own_frame(crate::forge_owner());
+            state.own_frame(crate::forge_owner(), core::slice::from_raw_parts(witnesses, len));
         }
     }
 
@@ -1027,6 +1027,16 @@ fn slots_below(offset: usize) -> Slots {
     slots
 }
 
+/// The slots of the frames below the one the window names at `offset` a cell an op touches may be
+/// open onto: all but those `cells` has apart. See Note [Window memory].
+fn cell_homes(cells: &crate::window::Cells, offset: usize) -> Slots {
+    let mut slots = slots_below(offset);
+    for distance in cells.apart.iter().filter(|&distance| distance < offset) {
+        slots.remove(offset - 1 - distance);
+    }
+    slots
+}
+
 /// The slots, as the window names them at `offset`, from `end` on.
 fn slots_from(end: usize, offset: usize) -> Slots {
     let mut slots = Slots::default();
@@ -1234,7 +1244,7 @@ pub struct JitContext {
     #[cfg(feature = "jit_disasm")]
     pub functions: HashMap<BlockId, String>,
     /// Each thunk compiled into JIT code, by block and offset. See Note
-    /// [Thunk patching].
+    /// [Thunk stitching].
     thunk_sites: HashMap<(BlockId, usize), ThunkSite, FxBuildHasher>,
     /// Each thunk site linked, by what `thunk_sites` had it as, to unlink. See Note [Watched
     /// tables].
@@ -1940,7 +1950,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             // (empty, streaming).
             // A thunk waiting to be linked into the block is the one whose path
             // got it hot: it's entered with that thunk's window. See Note [Thunk
-            // patching].
+            // stitching].
             let linked = self.jctx.waiting.get(&id).and_then(|sites| sites.last()).map(|site| site.window.clone());
             let window = match self.jctx.trace_policy {
                 Some(policy) => {
@@ -2192,7 +2202,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let ready: Vec<BlockId> = self.jctx.waiting.keys().filter(|target| self.jctx.blocks.contains_key(target)).copied().collect();
         for target in ready {
             for site in self.jctx.waiting.remove(&target).unwrap() {
-                self.patch_thunk(site, target);
+                self.stitch_thunk(site, target);
             }
         }
 
@@ -2298,8 +2308,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         Some(entry)
     }
 
-    /// The thunk at `off` in `block` is now a jump to `target`: patch its JIT
-    /// code, if any, now or once `target` has some. See Note [Thunk patching].
+    /// The thunk at `off` in `block` is now a jump to `target`: stitch its JIT
+    /// code, if any, now or once `target` has some. See Note [Thunk stitching].
     pub fn link_thunk(&mut self, block: BlockId, off: usize, target: BlockId) {
         // Whether the site was compiled, not whether it ran: a thunk that never
         // ran is linked when it first runs and is forced, to a target compiled
@@ -2307,7 +2317,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         let Some(site) = self.jctx.thunk_sites.remove(&(block, off)) else { return };
         self.jctx.linked_sites.insert((block, off), site.clone());
         if self.jctx.blocks.contains_key(&target) {
-            self.patch_thunk(site, target);
+            self.stitch_thunk(site, target);
         } else {
             self.jctx.waiting.entry(target).or_default().push(site);
         }
@@ -2334,7 +2344,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
 
     /// Make the thunk site `site` jump into `target`'s JIT code, through its
     /// compensation code.
-    fn patch_thunk(&mut self, site: ThunkSite, target: BlockId) {
+    fn stitch_thunk(&mut self, site: ThunkSite, target: BlockId) {
         let stub = self.thunk_stub(&site.window, target);
         let rel = i32::try_from(stub as isize - (site.at as isize + NOP5.len() as isize)).expect("a thunk stub within rel32 of its site");
         let mut jmp = [0xe9, 0, 0, 0, 0];
@@ -2342,7 +2352,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         self.jctx.patch(site.at, &jmp);
     }
 
-    /// The compensation code a patched thunk site jumps to: the transfer from
+    /// The compensation code a stitched thunk site jumps to: the transfer from
     /// the thunk's `window` to `target`'s entry window, then a jump into it.
     /// The blocks of the region compiled from `root`: those reached from it, without code, that ran
     /// recently enough. See Note [Region selection].
@@ -2517,8 +2527,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         match res {
                             Residual::ExecWindow(w) | Residual::GuardDynamic(w) if !skips[off].is_empty() => {
                                 // Upvalues' cells may be open onto them. See Note [Window memory].
-                                if w.cells().is_some() {
-                                    events.extend(slots_below(at).iter().map(Event::Read));
+                                if let Some(cells) = w.cells() {
+                                    events.extend(cell_homes(&cells, at).iter().map(Event::Read));
                                 }
                                 let operands = w.operands().iter().zip(w.accesses());
                                 events.extend(operands.clone().filter(|(_, a)| a.reads()).map(|(&slot, _)| Event::Read(slot.wrapping_add(at))));
@@ -2677,13 +2687,13 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     Residual::ExecWindow(_) | Residual::GuardDynamic(_) if !skips[b][off].is_empty() => {
                         let w = windows[b][off].as_ref().expect("a window op");
                         // See Note [Window memory].
-                        if w.cells().is_some() {
-                            steps.push(Step::Store(slots_below(at)));
+                        if let Some(cells) = w.cells() {
+                            steps.push(Step::Store(cell_homes(&cells, at)));
                         }
                         of[off] = Some(steps.len());
                         steps.push(Step::Op(Framed::new(&**w, at), skips[b][off].clone()));
-                        if w.cells() == Some(Access::Write) {
-                            steps.push(Step::Kill(slots_below(at)));
+                        if let Some(cells) = w.cells().filter(|cells| cells.access == Access::Write) {
+                            steps.push(Step::Kill(cell_homes(&cells, at)));
                         }
                     }
                     Residual::Emit(e) => {
@@ -3762,7 +3772,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     depth.set(depth.get() - 1);
                     offset.set(offset_past(res, offset.get()));
                 },
-                Residual::Uninline { entry, .. } => {
+                Residual::Uninline { entry, witnesses, .. } => {
                     // `Inline` kept what a call keeps, and the continuation. Without the continuation
                     // the record is a call's, so the callee's version is called on the frame as it
                     // is. A version with no code yet is linked once it has some. Until then the
@@ -3782,6 +3792,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; .arch x64
                         ; add rsp, 16
                         ; mov rdi, r12
+                        ; mov rsi, QWORD witnesses.as_ptr() as i64
+                        ; mov rdx, QWORD witnesses.len() as i64
                         ; call extern (JitHelper::own_frame as *const () as usize)
                         // The stack may have moved.
                         ; lea rcx, r12 => RunState.vals
@@ -4005,8 +4017,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let w = &w;
                     let stencils = &mut self.jctx.stencils;
                     // See Note [Window memory].
-                    if w.cells().is_some() {
-                        let stores = alloc.clean(&slots_below(offset.get()));
+                    if let Some(cells) = w.cells() {
+                        let stores = alloc.clean(&cell_homes(&cells, offset.get()));
                         window_dump!(self.jctx, "      cells: store {}", emits_line(&stores));
                         for emit in stores {
                             emit_window_move(ops, emit, offset.get());
@@ -4112,8 +4124,8 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         }
                     }
                     // Its sets of upvalues may have been of their stack homes.
-                    if w.cells() == Some(Access::Write) {
-                        alloc.forget(&slots_below(offset.get()));
+                    if let Some(cells) = w.cells().filter(|cells| cells.access == Access::Write) {
+                        alloc.forget(&cell_homes(&cells, offset.get()));
                     }
                     match (res, other, copied) {
                         // Its body ran on the stack, and selected: as an inline guard, a
@@ -4149,7 +4161,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 },
                 Residual::Thunk(_) | Residual::Tripped(_) => {
                     // Room for a `jmp rel32` past the exit, once the thunk is a
-                    // jump. See Note [Thunk patching]. A trip always exits. See Note
+                    // jump. See Note [Thunk stitching]. A trip always exits. See Note
                     // [Watched tables].
                     if matches!(res, Residual::Thunk(_)) {
                         self.jctx.region_sites.push((id, off, ops.offset().0, alloc.cache().clone()));
