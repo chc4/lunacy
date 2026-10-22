@@ -31,6 +31,27 @@ pub struct BlockId(pub usize);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct HashRef(pub u8);
 
+/// A hash key and the index its init expects the key at, in one word for a window op's hole.
+#[derive(Debug, Clone, Copy)]
+#[repr(transparent)]
+pub struct PackedHref(u64);
+
+impl PackedHref {
+    pub fn pack(href: HashRef, index: usize) -> Self {
+        PackedHref((index as u64) << 8 | href.0 as u64)
+    }
+
+    #[inline(always)]
+    pub fn href(self) -> HashRef {
+        HashRef(self.0 as u8)
+    }
+
+    #[inline(always)]
+    pub fn index(self) -> usize {
+        (self.0 >> 8) as usize
+    }
+}
+
 /// Where the table a hash key's field is in comes from. See Note [Table
 /// metatables].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -38,7 +59,7 @@ pub enum Place {
     /// The hash key's register's: a table's own, or a userdata's `__index`
     /// table.
     Register,
-    /// The metatable of the table hash key `h`'s witness found.
+    /// The metatable of the table at hash key `h`'s place.
     Metatable(HashRef),
     /// The table in hash key `h`'s field, through its witness: an `__index`.
     Index(HashRef),
@@ -47,26 +68,6 @@ pub enum Place {
 }
 
 impl Place {
-    /// As a JIT helper takes it.
-    pub fn bits(self) -> u16 {
-        match self {
-            Place::Register => 0,
-            Place::Metatable(h) => 1 << 8 | h.0 as u16,
-            Place::Index(h) => 2 << 8 | h.0 as u16,
-            Place::UserdataMetatable => 3 << 8,
-        }
-    }
-
-    pub fn from_bits(bits: u16) -> Self {
-        let h = HashRef(bits as u8);
-        match bits >> 8 {
-            0 => Place::Register,
-            1 => Place::Metatable(h),
-            2 => Place::Index(h),
-            _ => Place::UserdataMetatable,
-        }
-    }
-
     /// Whether the table is found from the hash key's own register, which its hash keys live with.
     pub fn own_register(self) -> bool {
         matches!(self, Place::Register | Place::UserdataMetatable)
@@ -2567,37 +2568,6 @@ impl<'src, 'intern> RunState<'src, 'intern> {
             LValue::Userdata(u) => u.ro(owner).index_table(owner, &self.index_key),
             _ => unreachable!("slot {slot} holds no table or userdata"),
         }
-    }
-
-    /// The table at `place`, for a hash key of `slot`: the one a key found
-    /// down a table's `__index` chain is in comes from the witnesses of the
-    /// hash keys before it, which hold. See Note [Table metatables].
-    pub fn place_table(&self, owner: &Owner, slot: usize, place: Place) -> Option<Tc<Table<'src, 'intern>>> {
-        match place {
-            Place::Register => self.hash_part_at(owner, slot),
-            Place::Metatable(h) => {
-                let witness = self.hash_witnesses[self.witness_base + h.0 as usize];
-                // Its witness holds, so its table is alive.
-                let tab: Tc<Table<'src, 'intern>> = Tc(unsafe { Gc::from_addr(witness.table) });
-                tab.ro(owner).metatable.clone()
-            },
-            Place::Index(h) => {
-                let witness = self.hash_witnesses[self.witness_base + h.0 as usize];
-                unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.as_table()
-            },
-            Place::UserdataMetatable => match self.vals[self.base + slot].unbox() {
-                LValue::Userdata(u) => u.ro(owner).metatable().cloned(),
-                _ => None,
-            },
-        }
-    }
-
-    /// Whether the frame's witness for `href`, a hash key of `slot` at
-    /// `place`, still holds: its table is the one it saw, at the epoch it saw.
-    /// See Note [Hash witnesses].
-    pub fn witness_holds(&self, owner: &Owner, slot: usize, place: Place, href: u8) -> bool {
-        let witness = self.hash_witnesses[self.witness_base + href as usize];
-        self.place_table(owner, slot, place).is_some_and(|tab| witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch)
     }
 
     /// Whether the entry at the index of the frame's witness for `href`, a

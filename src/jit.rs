@@ -205,17 +205,6 @@ impl JitHelper {
             val.unbox().typeof_() == expected
         }
     }
-    pub unsafe extern "C" fn check_epoch(state: *mut (), tab: usize, href: u8, place: u16) -> bool {
-        unsafe {
-            //println!("state {:?} {} {}", state, tab, href);
-            let state = state as *mut RunState;
-            // Forge an owner
-            let mut owner = ();
-            let owner = (&raw mut owner as *mut Owner).as_ref_unchecked();
-            let rs = &*state;
-            rs.witness_holds(owner, tab, crate::vm::Place::from_bits(place), href)
-        }
-    }
     pub unsafe extern "C" fn check_hash_guard(state: *mut (), tab: usize, href: u8, expected: LType, key: u64) -> bool {
         unsafe {
             let state = state as *mut RunState;
@@ -1382,8 +1371,7 @@ impl Drop for JitContext {
         #[cfg(feature = "jit_disasm")]
         {
             let mut symbols: HashMap<usize, String> = self.blocks.iter().map(|(id, block)| (block.ptr.0 as usize, format!("block {}", id.0))).collect();
-            let helpers: [(usize, &str); 6] = [
-                (JitHelper::check_epoch as *const () as usize, "JitHelper::check_epoch"),
+            let helpers: [(usize, &str); 5] = [
                 (JitHelper::check_guard as *const () as usize, "JitHelper::check_guard"),
                 (JitHelper::check_hash_guard as *const () as usize, "JitHelper::check_hash_guard"),
                 (JitHelper::dynamic_call as *const () as usize, "JitHelper::dynamic_call"),
@@ -1617,7 +1605,7 @@ fn runs_to(residuals: &[Residual]) -> usize {
             return off + 1;
         }
         guarded = matches!(res, Residual::Guard { .. } | Residual::NumericGuard { .. } | Residual::NativeGuard { .. }
-            | Residual::LuaGuard { .. } | Residual::GuardWitness { .. } | Residual::EpochCheck { .. } | Residual::HashGuard { .. }
+            | Residual::LuaGuard { .. } | Residual::GuardWitness { .. } | Residual::HashGuard { .. }
             | Residual::GuardDynamic(_) | Residual::ReturnedFrom(_));
     }
     residuals.len()
@@ -3135,20 +3123,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         ; mov rsi, WORD (*idx as i32) // idx
                         ; mov rdx, WORD (expected_u8 as i32) // expected
                         ; call extern (JitHelper::check_guard as *const () as usize)
-                        ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
-                        ; jnz =>insts[off + 2]
-                        // Fail: fallthrough to next (off + 1)
-                    );
-                },
-                Residual::EpochCheck { tab, href, place } => {
-                    let href_u8 = href.0;
-                    dynasm!(ops
-                        ; .arch x64
-                        ; mov rdi, r12 // state
-                        ; mov rsi, QWORD (*tab as i64)
-                        ; mov rdx, WORD (href_u8 as i32)
-                        ; mov rcx, WORD (place.bits() as i32)
-                        ; call extern (JitHelper::check_epoch as *const () as usize)
                         ; test al, 1 // a returned bool is bit 0: the rest of al may not be zero
                         ; jnz =>insts[off + 2]
                         // Fail: fallthrough to next (off + 1)

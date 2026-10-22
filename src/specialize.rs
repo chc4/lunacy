@@ -12,7 +12,7 @@ use crate::classes::{ClassFact, Label, Loc, Root, Target};
 use qcell::{LCell, LCellOwner};
 use crate::{Owner, TLCell, TlcOwner};
 use crate::vm::{Tc, Vm};
-use crate::vm::{BlockId, HashRef, Place};
+use crate::vm::{BlockId, HashRef, PackedHref, Place};
 use crate::vm::{LClosure, LProto};
 use crate::vm::{LValue, LType, Number, Table, FVec, LBoxed, LCanon, IStr};
 use crate::lboxed::is_integer;
@@ -162,7 +162,6 @@ impl std::fmt::Display for Residual {
             Residual::TailCall { entry: CallEntry::Context(_), a, b, .. } => write!(f, "tcall(?, {}, {})", a, b),
             Residual::HashGuard { tab, href, expected, .. } => write!(f, "hguard({}, {:?}, {})", tab, href, expected),
             Residual::GuardWitness { href, expected } => write!(f, "guard_witness({:?}, {})", href, expected),
-            Residual::EpochCheck { tab, href, place } => write!(f, "epoch({}, {:?}, {:?})", tab, href, place),
             Residual::Thunk(_) => write!(f, "thunk"),
             Residual::Tripped(of) => write!(f, "tripped({of:?})"),
             Residual::Select(targets) => write!(f, "select"),
@@ -502,6 +501,9 @@ pub struct HashKey<'src, 'intern> {
     /// For a key its table lacks, or has nil, found down the table's `__index`
     /// chain: the hash key it's found at. See Note [Table metatables].
     pub chain: Option<HashRef>,
+    /// Its table was found without the key. It has no witness, so it is checked by looking for
+    /// the key again. See Note [Table metatables].
+    pub missing: bool,
     /// Where an integer field type was found, which a store making the field a double
     /// contracts. See Note [Field types].
     pub origins: FieldOrigins,
@@ -520,8 +522,8 @@ impl std::fmt::Debug for FieldOrigins {
 
 impl PartialEq for HashKey<'_, '_> {
     fn eq(&self, other: &Self) -> bool {
-        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain)
-            == (other.idx, &other.key, &other.known_type, &other.hazards, other.place, other.chain)
+        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain, self.missing)
+            == (other.idx, &other.key, &other.known_type, &other.hazards, other.place, other.chain, other.missing)
     }
 }
 
@@ -529,7 +531,7 @@ impl Eq for HashKey<'_, '_> {}
 
 impl std::hash::Hash for HashKey<'_, '_> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain).hash(state)
+        (self.idx, &self.key, &self.known_type, &self.hazards, self.place, self.chain, self.missing).hash(state)
     }
 }
 
@@ -564,7 +566,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
 
     /// A new hash key, its index reserved until its href thunk finds its type.
     fn new(idx: usize, key: LConstant<'src, 'intern>) -> Self {
-        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
+        HashKey { idx, key, known_type: None, hazards: Default::default(), place: Place::Register, chain: None, missing: false, origins: FieldOrigins::default() }
     }
 
     /// Whether access through slot `at` needs no epoch check.
@@ -590,7 +592,7 @@ impl<'src, 'intern> HashKey<'src, 'intern> {
     /// A free index, as every free index is: what the hash key there was tells nothing. See
     /// Note [Version compatibility].
     fn free() -> Self {
-        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SlotSet::default(), place: Place::Register, chain: None, origins: FieldOrigins::default() }
+        HashKey { idx: OUTER, key: crate::chunk::Constant::Nil, known_type: None, hazards: SlotSet::default(), place: Place::Register, chain: None, missing: false, origins: FieldOrigins::default() }
     }
 
     /// Whether blocks compiled knowing `self` are correct for a context with
@@ -721,14 +723,15 @@ impl Reach {
     }
 }
 
-// Initialize a hash key: `at` is `index << 8 | href`. Its hot path finds the table's entry at
-// `index` has the key `key` and the frame's witness for `href` has its place, populating the
+// Initialize a hash key: `at` is the hash key and the index its key is expected at. Its hot path
+// finds the table's entry at that index has the key `key` and the frame's witness has its place,
+// populating the
 // witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
 // the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
 // witnesses] and [Field types].
-windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table) {
-    let (href, index) = (at as u8, (at >> 8) as usize);
-    let hidx = state.witness_base + href as usize;
+windowed!(writes HrefInit, [at: PackedHref, key: u64], [], |owner, state, base| (table) {
+    let index = at.index();
+    let hidx = state.witness_base + at.href().0 as usize;
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
     let address = tab.0.to_addr();
     let hit = {
@@ -748,9 +751,8 @@ windowed!(writes HrefInit, [at: u64, key: u64], [], |owner, state, base| (table)
         _ => true,
     }
 } cold {
-    let (href, index) = (at as u8, (at >> 8) as usize);
     let LValue::Table(tab) = table.unbox() else { unreachable!() };
-    href_init_slow(owner, state, tab, href, index, key)
+    href_init_slow(owner, state, tab, at, key)
 });
 
 // The witness of hash key `href` of its register's table, with no key: the table and its epoch,
@@ -781,41 +783,90 @@ fn witness_table<'src, 'intern>(owner: &Owner, state: &mut RunState<'src, 'inter
 // `HrefInit` for a hash key of a userdata, in its `__index` table, or with `META` its metatable:
 // exit 0 if that has the key, populating the witness, and 1 if not, or if there is no such table.
 // See Notes [Userdata fields] and [Arithmetic metamethods].
-windowed!(writes select HrefInitIndex, [at: u64, key: u64], [META: bool], |owner, state, base| (userdata) {
-    let (href, index) = (at as u8, (at >> 8) as usize);
+windowed!(writes select HrefInitIndex, [at: PackedHref, key: u64], [META: bool], |owner, state, base| (userdata) {
     let LValue::Userdata(u) = userdata.unbox() else { unreachable!() };
     let tab = if META { u.ro(owner).metatable().cloned() } else { u.ro(owner).index_table(owner, &state.index_key) };
     match tab {
-        Some(tab) => href_init_slow(owner, state, tab, href, index, key),
+        Some(tab) => href_init_slow(owner, state, tab, at, key),
         None => 1,
     }
 });
 
-/// The table at a place down an `__index` chain, from the witness of the hash key `link` before
-/// it: with `META`, the metatable of the table it witnesses (`Place::Metatable`), else the table
-/// it witnesses as its value (`Place::Index`). See Note [Table metatables].
+/// Where running code finds a hash key's table: its `Place`, resolved against the register's type
+/// and the hash keys before it. The last two are found through an `__index` hash key's witness,
+/// the rest from the register. See Note [Table metatables].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
+pub enum TableAt {
+    /// A table's own.
+    Table,
+    /// A table's metatable.
+    TableMetatable,
+    /// A userdata's `__index` table. See Note [Userdata fields].
+    UserdataIndex,
+    /// The metatable of a userdata's `__index` table.
+    UserdataIndexMetatable,
+    /// A userdata's own metatable.
+    UserdataMetatable,
+    /// The table in an `__index` hash key's field.
+    Index,
+    /// That table's metatable.
+    IndexMetatable,
+}
+
+/// A call of `$f` instantiated at the `TableAt` that `$at` is.
+macro_rules! with_at {
+    ($at:expr, $f:ident($($arg:expr),*)) => {
+        match $at {
+            TableAt::Table => $f::<{ TableAt::Table }>($($arg),*),
+            TableAt::TableMetatable => $f::<{ TableAt::TableMetatable }>($($arg),*),
+            TableAt::UserdataIndex => $f::<{ TableAt::UserdataIndex }>($($arg),*),
+            TableAt::UserdataIndexMetatable => $f::<{ TableAt::UserdataIndexMetatable }>($($arg),*),
+            TableAt::UserdataMetatable => $f::<{ TableAt::UserdataMetatable }>($($arg),*),
+            TableAt::Index => $f::<{ TableAt::Index }>($($arg),*),
+            TableAt::IndexMetatable => $f::<{ TableAt::IndexMetatable }>($($arg),*),
+        }
+    };
+}
+
+/// The table at `at` of the register's value `of`.
 #[inline(always)]
-fn table_at<'src, 'intern, const META: bool>(owner: &Owner, state: &RunState<'src, 'intern>, link: u8) -> Option<Tc<Table<'src, 'intern>>> {
-    let witness = state.hash_witnesses[state.witness_base + link as usize];
-    if META {
-        // Its witness holds, so its table is alive.
-        let tab: Tc<Table<'src, 'intern>> = Tc(unsafe { crate::gc::Gc::from_addr(witness.table) });
-        tab.ro(owner).metatable.clone()
-    } else {
-        unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.as_table()
+fn register_table<'src, 'intern>(owner: &Owner, state: &RunState<'src, 'intern>, at: TableAt, of: LBoxed<'src, 'intern>) -> Option<Tc<Table<'src, 'intern>>> {
+    let table = || {
+        let LValue::Table(tab) = of.unbox() else { unreachable!() };
+        tab
+    };
+    let userdata = || {
+        let LValue::Userdata(u) = of.unbox() else { unreachable!() };
+        u
+    };
+    match at {
+        TableAt::Table => Some(table()),
+        TableAt::TableMetatable => table().ro(owner).metatable.clone(),
+        TableAt::UserdataIndex => userdata().ro(owner).index_table(owner, &state.index_key),
+        TableAt::UserdataIndexMetatable => userdata().ro(owner).index_table(owner, &state.index_key)?.ro(owner).metatable.clone(),
+        TableAt::UserdataMetatable => userdata().ro(owner).metatable().cloned(),
+        TableAt::Index | TableAt::IndexMetatable => unreachable!(),
     }
 }
 
-// `HrefInit` for a hash key at a place down its register's `__index` chain, the table found
-// from the hash key `link`'s witness as `table_at` says: its hot path, `HrefInit`'s, on that
-// table, and its cold path finding the key wherever it is. Exit 0 if the table has the key,
-// populating the witness, and 1 if not, or if there's no table there. See Note [Table
-// metatables].
-windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner, state, base| () {
-    let (href, index) = (at as u8, (at >> 8) as usize);
-    let hidx = state.witness_base + href as usize;
-    // No table there is a miss, which the cold path finds again.
-    let hit = table_at::<META>(owner, state, link).and_then(|tab| {
+/// The table at `at` found through `__index` hash key `link`, whose witness holds. Its field is a
+/// table, as its guard checked.
+#[inline(always)]
+fn linked_table<'src, 'intern>(owner: &Owner, state: &RunState<'src, 'intern>, at: TableAt, link: HashRef) -> Option<Tc<Table<'src, 'intern>>> {
+    let witness = state.hash_witnesses[state.witness_base + link.0 as usize];
+    let LValue::Table(table) = unsafe { *witness.value.cast::<LBoxed<'src, 'intern>>() }.unbox() else { unreachable!() };
+    match at {
+        TableAt::Index => Some(table),
+        TableAt::IndexMetatable => table.ro(owner).metatable.clone(),
+        _ => unreachable!(),
+    }
+}
+
+/// `HrefInit`'s hot path on `tab`. True means the cold path has to finish.
+#[inline(always)]
+fn href_init_at<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Option<Tc<Table<'src, 'intern>>>, at: PackedHref, key: u64) -> bool {
+    let (index, hidx) = (at.index(), state.witness_base + at.href().0 as usize);
+    let hit = tab.and_then(|tab| {
         let address = tab.0.to_addr();
         let tab = tab.rw(owner);
         let epoch = tab.epoch;
@@ -832,49 +883,39 @@ windowed!(writes HrefInitAt, [at: u64, key: u64, link: u8], [META: bool], |owner
         },
         _ => true,
     }
+}
+
+// `HrefInit` in the table found through `__index` hash key `link`. Exit 0 if the table has the key
+// and 1 if not. See Note [Table metatables].
+windowed!(writes HrefInitAt, [at: PackedHref, key: u64, link: HashRef], [AT: TableAt], |owner, state, base| () {
+    let tab = linked_table(owner, state, AT, link);
+    href_init_at(owner, state, tab, at, key)
 } cold {
-    let (href, index) = (at as u8, (at >> 8) as usize);
-    match table_at::<META>(owner, state, link) {
-        Some(tab) => href_init_slow(owner, state, tab, href, index, key),
+    match linked_table(owner, state, AT, link) {
+        Some(tab) => href_init_slow(owner, state, tab, at, key),
         None => 1,
     }
 });
 
-/// `HrefInit` for a key the table in R(`idx`) was found without, as an object lacks a method its
-/// class has: an exec, called from JIT code rather than copied into it, as a copy would be a whole
-/// probe of the table. It looks the key up by `hash`, the table's hash of it, worked out as the
-/// residual is made, and finding the table still lacks it, populates the witness with no value,
-/// for the `__index` chain after it. Exit 0 is missing the key, 1 having it. See Notes [Table
-/// metatables] and [Hash witnesses].
-fn href_init_miss(idx: usize, at: u64, key: u64, hash: u64) -> ResidualExec {
-    ResidualExec::new("href_init_miss", Rc::new(move |owner, state| {
-        let (href, index) = (at as u8, (at >> 8) as usize);
-        let LValue::Table(tab) = state.vals[state.base + idx].unbox() else { unreachable!() };
-        let address = tab.0.to_addr();
-        let lacks = {
-            let tab = tab.ro(owner);
-            tab.hash.find(hash, |k| k.boxed().bits() == key).is_none().then_some(tab.epoch)
-        };
-        state.select = match lacks {
-            Some(epoch) => {
-                let hidx = state.witness_base + href as usize;
-                state.hash_witnesses.grow(hidx + 1);
-                state.witness_top = state.witness_top.max(hidx + 1);
-                state.hash_witnesses[hidx] = HashWitness { epoch, index, value: core::ptr::null_mut(), table: address };
-                0
-            },
-            // It has the key after all: its witness, wherever the key is.
-            None => 1 - href_init_slow(owner, state, tab, href, index, key),
-        };
-    }))
+/// Whether `tab` lacks the key with bits `key` and hash `hash`.
+#[inline(always)]
+fn lacks(owner: &Owner, tab: &Tc<Table<'_, '_>>, key: u64, hash: u64) -> bool {
+    tab.ro(owner).hash.find(hash, |k| k.boxed().bits() == key).is_none()
+}
+
+/// A constant key's bits, and its hash as a table's hash part hashes it.
+fn key_hash(key: &LConstant<'_, '_>) -> (u64, u64) {
+    let key = LCanon::constant(key);
+    (key.boxed().bits(), std::hash::BuildHasher::hash_one(&crate::vm::InternedHasher::default(), key))
 }
 
 /// `HrefInit`'s cold path: the key isn't at `index`, or the witness's place isn't there yet,
 /// which it makes. Exit 0 if `tab` has the key, populating the witness, and 1 if not.
 /// `rust-cold` (LLVM's `preserve_most`), so the cold stencil calling it with its window live
 /// needn't save the window around the call.
-extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Tc<Table<'src, 'intern>>, href: u8, index: usize, key: u64) -> usize {
-    let hidx = state.witness_base + href as usize;
+extern "rust-cold" fn href_init_slow<'src, 'intern>(owner: &mut Owner, state: &mut RunState<'src, 'intern>, tab: Tc<Table<'src, 'intern>>, at: PackedHref, key: u64) -> usize {
+    let index = at.index();
+    let hidx = state.witness_base + at.href().0 as usize;
     state.hash_witnesses.grow(hidx + 1);
     state.witness_top = state.witness_top.max(hidx + 1);
     // Safety: the key is a constant's, which outlives the code using it.
@@ -1390,8 +1431,6 @@ pub enum Residual {
     /// `expected`: a `Guard` on the field rather than a slot. See Note [Field
     /// types].
     GuardWitness { href: HashRef, expected: LType },
-    /// `place` its hash key's. See Note [Table metatables].
-    EpochCheck { tab: usize, href: HashRef, place: Place },
     NativeGuard { idx: usize, ptr: *const () },
     NativeCall { nf: NativeFunc, a: u16, b: u16, c: u16 },
     /// A call to the Lua function in R(A), The target `entry` is a prototype a `LuaGuard` or the
@@ -1883,7 +1922,7 @@ fn matched(wanted: &[HashKey<'static, 'static>], known: &[HashKey<'static, 'stat
             };
             let chain = chain.flatten();
             let from = known.iter().enumerate().position(|(from, have)| {
-                !have.orphan() && have.idx == want.idx && have.key == want.key && have.place == place && have.chain == chain
+                !have.orphan() && have.idx == want.idx && have.key == want.key && have.place == place && have.chain == chain && have.missing == want.missing
                     && !map.iter().any(|&(f, _)| f as usize == from)
             })?;
             map.push((from as u8, to as u8));
@@ -2376,8 +2415,12 @@ pub(crate) fn navigate(pc: SubPc, expected: &CType, found: &CType) -> (SubPc, Re
 // A load with a constant key follows the chain with hash keys. When its table lacks the key, or
 // has it nil, and has an `__index` table, the load uses two more hash keys: one for the
 // metatable's `__index` field, and one for the key in that table, which knows the type of the
-// field found there. Each has its own witness and epoch check like any other, and finds its
-// table through the witness before it, so a table with no metatable pays nothing for chains.
+// field found there. A table with no metatable pays nothing for chains.
+//
+// A hash key whose table lacks the key has no witness. It is checked by looking for the key
+// again, which needs no state. A metatable is found from the table before it, not from a hash
+// key's witness. So only the `__index` hash keys and the last one have witnesses, and each is
+// checked by its epoch. The next table down the chain is found through an `__index` witness.
 // The load continues this way for a bounded number of hops. A table without the key at the
 // end of the chain is a load the hash keys don't handle. Once the generator knows of a chain,
 // a later load of that key checks every hash key in it, and if any check fails the whole chain
@@ -3843,6 +3886,8 @@ impl Context {
                     mine.clear_checks();
                 },
                 Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.place == mine.place && theirs.chain == mine.chain && mine.known_type.is_some() && theirs.known_type.is_some() => {
+                    // Looking again holds whether or not a witness was made.
+                    mine.missing |= theirs.missing;
                     if mine.known_type != theirs.known_type {
                         mine.known_type = mine.known_type.as_ref().zip(theirs.known_type.as_ref()).map(|(mine, theirs)| mine.join(theirs));
                         mine.origins = FieldOrigins::default();
@@ -4072,6 +4117,71 @@ impl Context {
             at = before;
         }
         depth
+    }
+
+    /// Where running code finds the table at `place`, for a register holding a userdata if
+    /// `userdata`, and the `__index` hash key it is found through, if any. See Note [Table
+    /// metatables].
+    fn table_at(&self, place: Place, userdata: bool) -> (TableAt, Option<HashRef>) {
+        match place {
+            Place::Register if userdata => (TableAt::UserdataIndex, None),
+            Place::Register => (TableAt::Table, None),
+            Place::UserdataMetatable => (TableAt::UserdataMetatable, None),
+            Place::Index(link) => (TableAt::Index, Some(link)),
+            Place::Metatable(before) => match self.hkeys[before.0 as usize].place {
+                Place::Register if userdata => (TableAt::UserdataIndexMetatable, None),
+                Place::Register => (TableAt::TableMetatable, None),
+                Place::Index(link) => (TableAt::IndexMetatable, Some(link)),
+                other => unreachable!("a metatable of a hash key at {other:?}"),
+            },
+        }
+    }
+
+    /// The check that hash key `href` of `tab` still holds. See Note [Table metatables].
+    fn recheck(&self, tab: usize, href: HashRef) -> Residual {
+        /// Whether hash key `href`'s witness is of `tab` at its epoch.
+        #[inline(always)]
+        fn holds(owner: &Owner, state: &RunState<'_, '_>, tab: Option<Tc<Table<'_, '_>>>, href: HashRef) -> bool {
+            let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
+            tab.is_some_and(|tab| witness.table == tab.0.to_addr() && witness.epoch == tab.ro(owner).epoch)
+        }
+
+        // Whether hash key `href`'s witness still holds, of a table found from the register. See
+        // Note [Hash witnesses].
+        windowed!(reads guard EpochHoldsOf, [href: HashRef], [AT: TableAt], |owner, state, base| (of) {
+            holds(owner, state, register_table(owner, state, AT, of), href)
+        });
+
+        // `EpochHoldsOf` of a table found through `__index` hash key `link`.
+        windowed!(reads guard EpochHoldsAt, [href: HashRef, link: HashRef], [AT: TableAt], |owner, state, base| () {
+            holds(owner, state, linked_table(owner, state, AT, link), href)
+        });
+
+        // Whether a table found from the register still lacks a key. It checks a key found missing,
+        // which has no witness. See Note [Table metatables].
+        windowed!(reads guard StillLacksOf, [key: u64, hash: u64], [AT: TableAt], |owner, state, base| (of) {
+            register_table(owner, state, AT, of).is_some_and(|tab| lacks(owner, &tab, key, hash))
+        });
+
+        // `StillLacksOf` of a table found through `__index` hash key `link`.
+        windowed!(reads guard StillLacksAt, [key: u64, hash: u64, link: HashRef], [AT: TableAt], |owner, state, base| () {
+            linked_table(owner, state, AT, link).is_some_and(|tab| lacks(owner, &tab, key, hash))
+        });
+
+        fn check<const AT: TableAt>(missing: bool, href: HashRef, key: u64, hash: u64, tab: usize, link: Option<HashRef>) -> Rc<dyn Window> {
+            match (link, missing) {
+                (None, false) => Rc::new(EpochHoldsOf::<AT>::new(href, &[tab])),
+                (None, true) => Rc::new(StillLacksOf::<AT>::new(key, hash, &[tab])),
+                (Some(link), false) => Rc::new(EpochHoldsAt::<AT>::new(href, link, &[])),
+                (Some(link), true) => Rc::new(StillLacksAt::<AT>::new(key, hash, link, &[])),
+            }
+        }
+
+        let hkey = &self.hkeys[href.0 as usize];
+        let (key, hash) = key_hash(&hkey.key);
+        let userdata = matches!(self.types[tab], CType::Type(LType::Userdata) | CType::Shape(LType::Userdata, _));
+        let (at, link) = self.table_at(hkey.place, userdata);
+        Residual::GuardDynamic(with_at!(at, check(hkey.missing, href, key, hash, tab, link)))
     }
 
     /// Set optimization hazards for a stack slot, potentially scoped to only information which
@@ -6643,7 +6753,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                         held.iter_mut().for_each(|arg| *arg = None);
                     }
                     Residual::Guard { idx, .. } | Residual::NativeGuard { idx, .. } | Residual::LuaGuard { idx, .. } if upvalued.contains(idx) => measured.reused += 1,
-                    Residual::GuardWitness { .. } | Residual::HashGuard { .. } | Residual::EpochCheck { .. } if *CREDITS_ALL => measured.reused += 1,
+                    Residual::GuardWitness { .. } | Residual::HashGuard { .. } if *CREDITS_ALL => measured.reused += 1,
                     _ => {}
                 }
             }
@@ -7133,7 +7243,11 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             let place = ctx.hkeys[href.0 as usize].place;
             debug!("forcing href thunk for {idx} {href:?} {:?}", ctx.hkeys[href.0 as usize]);
             let key = LCanon::new((&ctx.hkeys[href.0 as usize].key).into(), state.intern);
-            let tab = state.place_table(owner, idx, place);
+            let receiver = state.vals[state.base + idx];
+            let tab = match ctx.table_at(place, receiver.unbox().typeof_() == LType::Userdata) {
+                (at, Some(link)) => linked_table(owner, state, at, link),
+                (at, None) => register_table(owner, state, at, receiver),
+            };
             let entry = tab.as_ref().and_then(|tab| { let hash = &tab.ro(owner).hash; hash.get_index_of(&key).map(|index| (index, *hash.get_index(index).unwrap().1)) });
             let nil = entry.is_none_or(|(_, val)| val.is_nil());
             // A nil field is no field: a load goes on down the chain. See Note [Table
@@ -7182,22 +7296,65 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     ctx_mut.types[idx] = CType::Shape(receiver, vec![href].into());
                 }
             }
-            let at = (index as u64) << 8 | href.0 as u64;
-            // A table lacking the key it's chained for expects to: its init's hot path is the
-            // miss.
-            let miss = chained && entry.is_none() && place == Place::Register && receiver == LType::Table;
-            let href_init = if miss {
-                // Safety: the key is a constant's, which outlives the code using it.
-                let hash = std::hash::BuildHasher::hash_one(&crate::vm::InternedHasher::default(), unsafe { LCanon::from_bits(kbits) });
-                Residual::Exec(href_init_miss(idx, at, kbits, hash))
-            } else { Residual::ExecWindow(match (place, receiver) {
-                (Place::Register, LType::Table) => Rc::new(HrefInit::new(at, kbits, &[idx])) as Rc<dyn Window>,
-                (Place::Register, LType::Userdata) => Rc::new(HrefInitIndex::<false>::new(at, kbits, &[idx])),
-                (Place::UserdataMetatable, _) => Rc::new(HrefInitIndex::<true>::new(at, kbits, &[idx])),
-                (Place::Register, _) => unreachable!("a hash key of a {receiver}"),
-                (Place::Metatable(link), _) => Rc::new(HrefInitAt::<true>::new(at, kbits, link.0, &[])),
-                (Place::Index(link), _) => Rc::new(HrefInitAt::<false>::new(at, kbits, link.0, &[])),
-            }) };
+            let at = PackedHref::pack(href, index);
+            // A table lacking the key it's chained for expects to.
+            let miss = chained && entry.is_none() && match place {
+                Place::Register => receiver == LType::Table,
+                Place::Index(_) => true,
+                _ => false,
+            };
+            Rc::make_mut(&mut ctx_mut.hkeys)[href.0 as usize].missing = miss;
+            let (_, hash) = key_hash(&ctx_mut.hkeys[href.0 as usize].key);
+            // `HrefInit` in a table found from the register. Exits as `HrefInitAt`'s. See Note [Table
+            // metatables].
+            windowed!(writes HrefInitOf, [at: PackedHref, key: u64], [AT: TableAt], |owner, state, base| (of) {
+                let tab = register_table(owner, state, AT, of);
+                href_init_at(owner, state, tab, at, key)
+            } cold {
+                match register_table(owner, state, AT, of) {
+                    Some(tab) => href_init_slow(owner, state, tab, at, key),
+                    None => 1,
+                }
+            });
+
+            // `HrefInit` for a key a table found from the register was found without, as an object
+            // lacks its class's methods. It makes no witness. Exit 0 if the table lacks the key and 1
+            // if not. No table there lacks it. See Note [Table metatables].
+            windowed!(writes HrefInitMissOf, [at: PackedHref, key: u64, hash: u64], [AT: TableAt], |owner, state, base| (of) {
+                register_table(owner, state, AT, of).is_some_and(|tab| !lacks(owner, &tab, key, hash))
+            } cold {
+                match register_table(owner, state, AT, of) {
+                    Some(tab) => 1 - href_init_slow(owner, state, tab, at, key),
+                    None => 0,
+                }
+            });
+
+            // `HrefInitMissOf` of a table found through `__index` hash key `link`.
+            windowed!(writes HrefInitMissAt, [at: PackedHref, key: u64, hash: u64, link: HashRef], [AT: TableAt], |owner, state, base| () {
+                linked_table(owner, state, AT, link).is_some_and(|tab| !lacks(owner, &tab, key, hash))
+            } cold {
+                match linked_table(owner, state, AT, link) {
+                    Some(tab) => 1 - href_init_slow(owner, state, tab, at, key),
+                    None => 0,
+                }
+            });
+
+            fn init<const AT: TableAt>(miss: bool, at: PackedHref, key: u64, hash: u64, idx: usize, link: Option<HashRef>) -> Rc<dyn Window> {
+                match (link, miss) {
+                    (None, false) => Rc::new(HrefInitOf::<AT>::new(at, key, &[idx])),
+                    (None, true) => Rc::new(HrefInitMissOf::<AT>::new(at, key, hash, &[idx])),
+                    (Some(link), false) => Rc::new(HrefInitAt::<AT>::new(at, key, link, &[])),
+                    (Some(link), true) => Rc::new(HrefInitMissAt::<AT>::new(at, key, hash, link, &[])),
+                }
+            }
+
+            let href_init: Rc<dyn Window> = match ctx_mut.table_at(place, receiver == LType::Userdata) {
+                (TableAt::Table, None) if !miss => Rc::new(HrefInit::new(at, kbits, &[idx])),
+                (TableAt::UserdataIndex, None) => Rc::new(HrefInitIndex::<false>::new(at, kbits, &[idx])),
+                (TableAt::UserdataMetatable, None) => Rc::new(HrefInitIndex::<true>::new(at, kbits, &[idx])),
+                (table_at, link) => with_at!(table_at, init(miss, at, kbits, hash, idx, link)),
+            };
+            let href_init = Residual::ExecWindow(href_init);
             block_id = vm.reopen(block_id, thunk_pc, pc.0, appends);
             vm.blocks[block_id.0].instructions.push(href_init);
             let typed = vm.new_block(pc.0);
@@ -7302,7 +7459,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // epoches in our witness table they only ever would fail if a table transitions its type
         // inside a block, which is unlikely to happen very often.
         let thunk_coro = thunk_coro.clone();
-        self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab, href, place: Place::Register });
+        self.blocks[block_id.0].instructions.push(thunk_ctx.recheck(tab, href));
         // Build the thunk for if we fail the epoch check
         let fail_thunk = ThunkRef(Rc::new(RefCell::new(move |vm: &mut Specializer, owner: &mut Owner, state: &mut RunState, thunk_pc: usize| {
             debug!("hit epoch fail thunk");
@@ -7313,9 +7470,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             vm.jump_thunk(block_id, thunk_pc, check_block);
             let expected = thunk_ctx.hkeys[href.0 as usize].known_type.clone().expect("a live hash key");
             let update_href_thunk = vm.make_href_thunk(check_block, thunk_coro.clone(), tab, href.clone(), pc, thunk_ctx.clone(), false, chains, None, thunk_ctx.clone());
-            // A field of no stable type has nothing to check it still has: its
-            // hash key is found again. See Note [Field types].
-            let CType::Type(expected) = expected else {
+            // A field of no stable type has nothing to check it still has. A missing key has no
+            // witness to repair. Either is found again. See Note [Field types].
+            let (CType::Type(expected), false) = (expected, thunk_ctx.hkeys[href.0 as usize].missing) else {
                 vm.blocks[check_block.0].instructions.push(Residual::Thunk(update_href_thunk));
                 return;
             };
@@ -7398,7 +7555,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let after = vm.subblock(owner, pc.next_true(), holds, thunk_coro.clone(), ResumeArg::HashRef(handler, known));
                     if !ctx.hkeys[handler.0 as usize].checked(slot) {
                         let again = Residual::Thunk(vm.make_metamethod_thunk(block, thunk_coro.clone(), slot, event, pc, ctx.clone(), false, true));
-                        vm.blocks[block.0].instructions.push(Residual::EpochCheck { tab: slot, href: handler, place: Place::UserdataMetatable });
+                        vm.blocks[block.0].instructions.push(ctx.recheck(slot, handler));
                         vm.blocks[block.0].instructions.push(again);
                     }
                     vm.blocks[block.0].instructions.push(Residual::Jump(after));
@@ -7427,7 +7584,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let after = vm.subblock(owner, pc.next_true(), holds, thunk_coro.clone(), ResumeArg::HashRef(handler, known));
                 for h in [base, handler].into_iter().filter(|h| !ctx.hkeys[h.0 as usize].checked(slot)) {
                     let again = refind(vm, &ctx);
-                    vm.blocks[block.0].instructions.push(Residual::EpochCheck { tab: slot, href: h, place: ctx.hkeys[h.0 as usize].place });
+                    vm.blocks[block.0].instructions.push(ctx.recheck(slot, h));
                     vm.blocks[block.0].instructions.push(again);
                 }
                 vm.blocks[block.0].instructions.push(Residual::Jump(after));
@@ -7440,7 +7597,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 Some(base) => {
                     if !ctx.hkeys[base.0 as usize].checked(slot) {
                         let again = refind(vm, &ctx);
-                        vm.blocks[block.0].instructions.push(Residual::EpochCheck { tab: slot, href: base, place: Place::Register });
+                        vm.blocks[block.0].instructions.push(ctx.recheck(slot, base));
                         vm.blocks[block.0].instructions.push(again);
                     }
                     base
@@ -7638,7 +7795,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                             // any failing finds the key again. See Note [Table metatables].
                             for &h in &chain {
                                 let refind = self.make_href_thunk(block_id, coro.clone(), place, cached, pc, ctx.clone(), false, true, None, ctx.clone());
-                                self.blocks[block_id.0].instructions.push(Residual::EpochCheck { tab: place, href: h, place: ctx.hkeys[h.0 as usize].place });
+                                self.blocks[block_id.0].instructions.push(ctx.recheck(place, h));
                                 self.blocks[block_id.0].instructions.push(Residual::Thunk(refind));
                             }
                         }
@@ -8694,14 +8851,6 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                     let witness = state.hash_witnesses[state.witness_base + href.0 as usize];
                     let value = unsafe { *witness.value.cast::<LBoxed<'_, '_>>() };
                     off += if value.unbox().typeof_() == expected { 2 } else { 1 };
-                },
-                &Residual::EpochCheck { tab, href, place } => {
-                    if state.witness_holds(owner, tab, place, href.0) {
-                        // Fallthrough
-                        off += 2;
-                    } else {
-                        off += 1;
-                    }
                 },
                 &Residual::HashGuard { tab, href, key, expected } => {
                     if state.witness_entry_holds(owner, tab, href.0, key, expected) {
