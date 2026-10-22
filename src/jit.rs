@@ -11,7 +11,7 @@ use crate::stack::ValueStack;
 use crate::specialize::{Block, CallEntry, CType, Context, Residual, Specializer, SubPc};
 use crate::window::{stencil_body, Access, Body, Captures, Image, NextRef, StencilError, Window, EXITS, WINDOW};
 use crate::window_alloc::{Framed, RENAME, RENAME_STORE};
-use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Packed, Placement, Rise, Step, WindowAlloc, SCRATCH};
+use crate::window_alloc::{plan_trace, Cache, ALLOCATED, Emit, Equal, Packed, Placement, Rise, Step, WindowAlloc, SCRATCH};
 use crate::trace::{Block as TraceBlock, Event, Loops, Policy, Region, Slots};
 use dynasmrt::relocations::{Relocation, RelocationKind, RelocationSize};
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
@@ -1433,6 +1433,8 @@ pub struct BlockPlan {
     /// window then has only `dirty` dirty; any other block's also has what the
     /// first jump into it compiled has dirty.
     rises: bool,
+    /// The classes of its slots' values, which its entry window names together.
+    equal: Equal,
     /// Per residual, for a window op with a stencil, its `SKIP` and the placement
     /// planned before it.
     placed: Vec<Option<(u8, Packed)>>,
@@ -1445,7 +1447,7 @@ impl BlockPlan {
     /// compiled.
     fn entry_window(&self, from: &Cache) -> Cache {
         let none = Cache::default();
-        Cache::entry(self.entry.unpack(), self.unboxed, if self.rises { &none } else { from }, &self.dirty)
+        Cache::entry(self.entry.unpack(), self.unboxed, if self.rises { &none } else { from }, &self.dirty, &self.equal)
     }
 }
 
@@ -2556,7 +2558,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                                         // A block with code, entered with its window, or a cold
                                         // edge's exit, which stores the window. See Note [Region
                                         // selection].
-                                        None => Event::Exit(self.jctx.blocks.get(&target).map_or_else(Slots::default, |block| slots_of(block.window.regs()))),
+                                        None => Event::Exit(self.jctx.blocks.get(&target).map_or_else(Slots::default, |block| slots_of(&block.window.regs()))),
                                     });
                                 }
                             }
@@ -2640,7 +2642,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
         // What a block the trace leaves into reads first: its entry window's
         // slots, or those live into it; none for a side exit that never ran.
         let reads = |from: BlockId, target: BlockId, hot: bool| match self.jctx.blocks.get(&target) {
-            Some(done) => slots_of(done.window.regs()),
+            Some(done) => slots_of(&done.window.regs()),
             None if !hot && !cfg!(feature = "immediate_jit") && self.jctx.edges.recent(from, target) == 0 => Slots::default(),
             // A cold edge's exit stores the window. See Note [Region selection].
             None => match index.get(&target) {
@@ -2672,7 +2674,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             steps.push(Step::Start(rise.map(|(mut reads, writes)| {
                 reads.intersect(&live_in[b]);
                 Rise { reads, writes }
-            })));
+            }), self.equal_slots(ids[b], offsets[b])));
             let mut of = vec![None; block.instructions.len()];
             let mut offset = offsets[b];
             let mut dies = None;
@@ -2762,11 +2764,19 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
             .enumerate()
             .map(|(pos, &b)| {
                 let start = starts[pos];
-                let rises = !plan.trivial && matches!(steps[start], Step::Start(Some(_)));
-                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), unboxed: plan.unboxed[start], dirty: plan.dirty[start], rises, placed: placed(&step_of[pos]) })
+                let Step::Start(rise, equal) = &steps[start] else { unreachable!("a block's first step is its start") };
+                let rises = !plan.trivial && rise.is_some();
+                (ids[b], BlockPlan { entry: Packed::pack(&plan.windows[start]), unboxed: plan.unboxed[start], dirty: plan.dirty[start], rises, equal: equal.clone(), placed: placed(&step_of[pos]) })
             })
             .collect();
         (planned, exits)
+    }
+
+    /// The class of each window slot's value in block `id`'s context, its frame at `offset`: none
+    /// for a block that isn't a version. See Note [Window allocation].
+    fn equal_slots(&self, id: BlockId, offset: usize) -> Equal {
+        let Some(ctx) = &self.blocks[id.0].context else { return Equal::default() };
+        (0..offset + ctx.types.len()).map(|slot| slot.checked_sub(offset).and_then(|slot| ctx.values.slot_class(slot as u16))).collect()
     }
 
     /// JIT compile one block, returning the JIT code offset and optionally the next block to

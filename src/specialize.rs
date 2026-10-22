@@ -72,7 +72,7 @@ pub struct Block {
     allocates: bool,
     /// A version of a pc's context, which jumps to it enter. See Note [Version
     /// compatibility].
-    context: Option<Rc<Context>>,
+    pub(crate) context: Option<Rc<Context>>,
     /// The upvalue cells holding their upvalue's value whenever the block is entered, by
     /// `cell` index: every cell where its context isn't known. See Note [Upvalue cells].
     pub cells: u32,
@@ -3477,7 +3477,10 @@ impl Context {
 
     /// Whether a trip falsifies something it knows. See Note [Watched tables].
     fn trips(&self) -> bool {
-        self.values.all_facts().any(|fact| !fact.survives_trip())
+        // A call site keeps its context as it was made, which may be unsettled.
+        let mut values = self.values.clone();
+        values.settle();
+        values.all_facts().any(|fact| !fact.survives_trip())
     }
 
     /// The slot of the table, and the name, of the field hash key `href` names: a string key of a
@@ -6186,6 +6189,12 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 let mut theirs = hkey.clone();
                 theirs.idx = owner;
                 theirs.clear_checks();
+                // A check made through the parameter holds for every caller slot holding that table.
+                if hkey.checked(hkey.idx) {
+                    for slot in (0..caller.types.len()).filter(|&slot| slot == owner || caller.values.same(Loc::root(Root::Slot(slot as u16)), Loc::root(Root::Slot(owner as u16)))) {
+                        theirs.check(slot);
+                    }
+                }
                 gained.push((owner, HashRef(i as u8)));
                 theirs
             },

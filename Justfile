@@ -16,14 +16,18 @@ CPU := "2"
 # wait for it. Each command takes it, never a recipe calling another, which
 # would wait on itself; `cargo watch`, which never ends, doesn't.
 BENCH_LOCK := env_var_or_default("LUNACY_BENCH_LOCK", "/tmp/lunacy-bench.lock")
-# The prefix of a timed command: the lock, then pinned to `CPU`.
-TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU
-# The prefix of a sampled command: the lock.
-SAMPLED := "flock " + BENCH_LOCK
+# The most address space, in bytes, that each process a command starts may use. A runaway run or
+# build fails to allocate instead of exhausting the machine's memory.
+MEM_CAP := env_var_or_default("LUNACY_MEM_CAP", "8589934592")
+CAP := "prlimit --as=" + MEM_CAP
+# The prefix of a timed command: the lock, pinned to `CPU`, under the memory cap.
+TIMED := "flock " + BENCH_LOCK + " taskset -c " + CPU + " " + CAP
+# The prefix of a sampled command: the lock, under the memory cap.
+SAMPLED := "flock " + BENCH_LOCK + " " + CAP
 # The prefix of a build, test or other run that loads the machine without
 # measuring: the lock shared, so that any number run together, but none while a
-# timed or sampled run holds it, nor one while they do.
-SHARED := "flock -s " + BENCH_LOCK
+# timed or sampled run holds it, nor one while they do. It is under the memory cap too.
+SHARED := "flock -s " + BENCH_LOCK + " " + CAP
 
 # Every test: `test`, then `test-stencils`.
 tests: test test-stencils
@@ -1017,8 +1021,10 @@ perf-stat-uxn-slope long='uxn_loop' short='uxn_loop_short' iterations='983025' r
 # `perf-stat-uxn-slope` for hardware counters `events` (`perf stat`, the mean of `runs`), of the
 # implementations whose names match `only` (a regex): each one's counts on `long` and `short` in
 # `out`/<implementation>.{long,short}.csv, and per iteration of the loop (tools/uxn_slope.py).
-# Compare runs, say with a knob set and without, with tools/uxn_slope.py over their `out`s.
-perf-stat-uxn-slope-events out='working/uxn-slope' only='lunacy' long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5' events='cycles,instructions,branches,branch-misses,stalled-cycles-frontend,L1-dcache-loads,L1-dcache-load-misses,L1-icache-load-misses,iTLB-load-misses': unsafe-compile unsafe-magic-compile _raven
+# Compare runs, say with a knob set and without, with tools/uxn_slope.py over their `out`s. The
+# default events are few enough for the core to count over the whole run. More events are
+# multiplexed and scaled, and then the slope moves by several percent between identical runs.
+perf-stat-uxn-slope-events out='working/uxn-slope' only='lunacy' long='uxn_loop' short='uxn_loop_short' iterations='983025' runs='5' events='cycles,instructions': unsafe-compile unsafe-magic-compile _raven
     #!/usr/bin/env bash
     set -euo pipefail
     rm -rf {{out}} && mkdir -p {{out}}
@@ -1446,21 +1452,20 @@ hyperfines-full:
     for run in {{HYPERFINES}}; do just hyperfine-full ${run%:*} ${run#*:}; done
     python3 tools/bench_history.py report
 
-# Compare this checkout's release build under each feature set in `sets`
-# (comma separated features, or `none`) on one benchmark: each built in turn
-# into target/release and copied to target/features/<set>/bench.
+# Compare this checkout's unsafe build under each feature set in `sets` on one benchmark. A set
+# is comma separated features, or `none`. Each set builds into a target directory of its own.
 hyperfine-features benchmark times +sets:
     #!/usr/bin/env bash
     set -euo pipefail
     just _luac {{benchmark}}
     commands=()
     for set in {{sets}}; do
-        features=$set; if [ $set = none ]; then features=""; fi
-        {{SHARED}} cargo build --release --bin bench --features "$features"
-        mkdir -p target/features/$set && cp target/release/bench target/features/$set/bench
-        commands+=(-n $set "target/features/$set/bench working/{{benchmark}}.bin {{times}}")
+        features=unsafe; if [ $set != none ]; then features="unsafe,$set"; fi
+        {{SHARED}} cargo build --profile unsafe --no-default-features --features "$features" --bin bench \
+            --target-dir target/features/$set -Z build-std="core,std,panic_abort"
+        commands+=(-n $set "target/features/$set/unsafe/bench working/{{benchmark}}.bin {{times}}")
     done
-    {{TIMED}} hyperfine --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
+    {{TIMED}} hyperfine -i --warmup {{WARMUP}} --max-runs {{MAX_RUNS}} --export-markdown working/hyperfine-{{benchmark}}-{{times}}-features.md "${commands[@]}"
 
 # `hyperfine-features` over HYPERFINES, then every comparison's table.
 hyperfines-features +sets:

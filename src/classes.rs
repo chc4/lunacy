@@ -225,6 +225,12 @@ impl<F> Default for Classes<F> {
 }
 
 impl<F: ClassFact> Classes<F> {
+    /// The class of the value slot `slot` holds, if it is in one. Slots of one class hold one value.
+    pub fn slot_class(&self, slot: u16) -> Option<u32> {
+        assert!(!self.unsettled.0, "unsettled classes asked what a slot holds");
+        self.root_class(Root::Slot(slot))
+    }
+
     fn root_class(&self, root: Root) -> Option<u32> {
         self.roots.binary_search_by_key(&root, |&(r, _)| r).ok().map(|i| self.roots[i].1)
     }
