@@ -11,11 +11,11 @@ use crate::vm::{InternedHasher, LCanon};
 // ~~~~~~~~~~~~~~~~~~~~~~~
 // A table's hash part stores its key-value pairs in the order their keys were first inserted, and
 // a hash table mapping each key to its pair's index. The hash table has a power-of-two count of
-// slots, each empty or holding a pair's index. It uses Robin Hood hashing, with no key further past
-// the slot its hash masks to than log2 of the slot count, so a lookup probes at most that many
-// slots after its first, and stops at an empty one. An insertion that would place a key further,
-// or fill more than seven eighths of the slots, doubles the hash table. Keys are canonical (Note [Canonical values]), so a pair is a key's when its key has the same
-// bits.
+// slots, each empty or holding a pair's index. It uses Robin Hood hashing, and no key is more than
+// log2 of the slot count past the slot its hash maps to. So a lookup probes a bounded number of
+// slots, and stops early at an empty one. An insertion doubles the hash table when it would break
+// that bound or fill more than seven eighths of the slots. Keys are canonical, so two keys are
+// equal exactly when their bits are. See Note [Canonical values].
 //
 // No key is removed: a key set to nil keeps its pair, so a pair's index doesn't change until the
 // part is cleared. Inserting a key may reallocate the key-value storage, so it increments the
@@ -148,12 +148,12 @@ impl<'src, 'intern, S: BuildHasher + Default> HashPart<'src, 'intern, S> {
 }
 
 impl<'src, 'intern, S: BuildHasher> HashPart<'src, 'intern, S> {
-    /// The index of the pair whose key `is` accepts, among the keys of hash `hash` by `hasher`.
+    /// The index of the pair whose key has hash `hash` and satisfies `is`.
     pub fn find(&self, hash: u64, is: impl Fn(&LCanon<'src, 'intern>) -> bool) -> Option<usize> {
         let (slots, pairs) = (self.slots(), self.pairs());
         let mut at = hash as usize & self.mask;
         for _ in 0..=self.max_displacement() {
-            // `at` is masked to the slots, and a slot holds the index of a pair there is.
+            // `at` is masked to the slots, and every nonempty slot indexes a pair.
             let Some(&slot) = slots.get(at) else { unreachable!() };
             if slot == 0 {
                 return None;
@@ -185,7 +185,7 @@ impl<'src, 'intern, S: BuildHasher> HashPart<'src, 'intern, S> {
         Some((at, &mut self.pairs_mut()[at].value))
     }
 
-    /// Set `key`'s value, giving its old value, or append its pair if it has none.
+    /// Set `key`'s value and return its old one. A new key's pair is appended.
     pub fn insert(&mut self, key: LCanon<'src, 'intern>, value: LBoxed<'src, 'intern>) -> Option<LBoxed<'src, 'intern>> {
         let hash = self.hasher.hash_one(key);
         if let Some(at) = self.find(hash, |k| *k == key) {
@@ -214,9 +214,9 @@ impl<'src, 'intern, S: BuildHasher> HashPart<'src, 'intern, S> {
         self.hasher.hash_one(self.pairs()[slot as usize - 1].key)
     }
 
-    /// Put the pair `slot` names, of hash `hash`, into the hash table, taking the slot of any key
-    /// nearer its own and moving that key on. False if a key would be further than
-    /// `max_displacement` from its own slot, leaving the hash table to be rebuilt.
+    /// Put the pair `slot` names, whose key has hash `hash`, into the hash table. It takes the slot
+    /// of any key nearer its own slot and moves that key on. It returns false if a key would end up
+    /// further than `max_displacement` from its own slot, and the hash table must then be rebuilt.
     fn place(&mut self, hash: u64, mut slot: u32) -> bool {
         debug_assert!(!std::ptr::eq(self.table, EMPTY.as_ptr()));
         let (table, mask) = (self.table, self.mask);
@@ -353,8 +353,8 @@ mod tests {
         agrees(&part, &reference, &order);
     }
 
-    /// Keys whose hashes share their low bits grow the hash table until they're each near their
-    /// own slot, and each is found, as is a key missing among them.
+    /// Keys whose hashes share their low bits make the hash table grow until each is near its own
+    /// slot. Each is found, and a missing key with the same low bits isn't.
     #[test]
     fn colliding_keys_are_each_found() {
         let mut part = Part::with_capacity(64);

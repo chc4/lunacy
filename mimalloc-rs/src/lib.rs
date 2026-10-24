@@ -45,12 +45,12 @@ use ffi::*;
 /// ```
 pub struct MiMalloc;
 
-/// The alignment mimalloc gives every block at least this large (`MI_MAX_ALIGN_SIZE`).
+/// The alignment of every mimalloc block of at least this size (`MI_MAX_ALIGN_SIZE`).
 const MIN_ALIGN: usize = 16;
 
-/// Whether a block of `size` bytes from mimalloc's plain allocation is aligned to `align`, as
-/// Rust's `System` decides for `malloc`. Its aligned allocation takes a slow path for any block
-/// size that isn't a power of two whenever that size's page has no free block, and that path
+/// Whether mimalloc's plain allocation of `size` bytes is aligned to `align`, decided as Rust's
+/// `System` does for `malloc`. We avoid the aligned allocation where we can. For a size that isn't
+/// a power of two, it takes a slow path whenever that size's page has no free block. The slow path
 /// allocates from another size, so the page never refills.
 #[inline]
 fn plain(size: usize, align: usize) -> bool {

@@ -1020,8 +1020,8 @@ impl Hash for StringBytes<'_> {
     }
 }
 
-/// The position of the string key of `bytes` in `hash`, which needs no intern arena: it hashes as
-/// the interned string does. See Note [Canonical values].
+/// The index of the string key with bytes `bytes` in `hash`. It needs no intern arena, since the
+/// bytes hash as their interned string does. See Note [Canonical values].
 fn string_index(hash: &HashPart<'_, '_>, bytes: &[u8]) -> Option<usize> {
     hash.find(hash.hasher().hash_one(StringBytes(bytes)),|key| matches!(key.boxed().unbox(), LValue::InternedString(s) if s.as_bytes() == bytes))
 }

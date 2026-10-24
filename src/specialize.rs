@@ -723,12 +723,10 @@ impl Reach {
     }
 }
 
-// Initialize a hash key: `at` is the hash key and the index its key is expected at. Its hot path
-// finds the table's entry at that index has the key `key` and the frame's witness has its place,
-// populating the
-// witness; its cold path finds the key wherever it is (`href_init_slow`). Exit 0 if the table has
-// the key, where the field's type is guarded (`GuardWitness`), and 1 if not. See Notes [Hash
-// witnesses] and [Field types].
+// Initialize hash key `at`'s witness, of the table in the register. The hot path finds `key` at
+// the index `at` expects, with room for the witness already made. The cold path finds the key
+// wherever it is. Exit 0 if the table has the key, where the field's type is guarded
+// (`GuardWitness`), and 1 if not. See Notes [Hash witnesses] and [Field types].
 windowed!(writes HrefInit, [at: PackedHref, key: u64], [], |owner, state, base| (table) {
     let index = at.index();
     let hidx = state.witness_base + at.href().0 as usize;
@@ -792,9 +790,8 @@ windowed!(writes select HrefInitIndex, [at: PackedHref, key: u64], [META: bool],
     }
 });
 
-/// Where running code finds a hash key's table: its `Place`, resolved against the register's type
-/// and the hash keys before it. The last two are found through an `__index` hash key's witness,
-/// the rest from the register. See Note [Table metatables].
+/// Where running code finds a hash key's table. It is the hash key's `Place`, resolved against its
+/// register's type and the hash keys before it. See Note [Table metatables].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, core::marker::ConstParamTy)]
 pub enum TableAt {
     /// A table's own.
@@ -807,13 +804,13 @@ pub enum TableAt {
     UserdataIndexMetatable,
     /// A userdata's own metatable.
     UserdataMetatable,
-    /// The table in an `__index` hash key's field.
+    /// The table in an `__index` hash key's field, found through its witness.
     Index,
     /// That table's metatable.
     IndexMetatable,
 }
 
-/// A call of `$f` instantiated at the `TableAt` that `$at` is.
+/// Call `$f` with its `TableAt` parameter set to the value of `$at`.
 macro_rules! with_at {
     ($at:expr, $f:ident($($arg:expr),*)) => {
         match $at {
@@ -828,7 +825,7 @@ macro_rules! with_at {
     };
 }
 
-/// The table at `at` of the register's value `of`.
+/// The table at `at`, found from the register's value `of`.
 #[inline(always)]
 fn register_table<'src, 'intern>(owner: &Owner, state: &RunState<'src, 'intern>, at: TableAt, of: LBoxed<'src, 'intern>) -> Option<Tc<Table<'src, 'intern>>> {
     let table = || {
@@ -849,8 +846,8 @@ fn register_table<'src, 'intern>(owner: &Owner, state: &RunState<'src, 'intern>,
     }
 }
 
-/// The table at `at` found through `__index` hash key `link`, whose witness holds. Its field is a
-/// table, as its guard checked.
+/// The table at `at`, found through the field of `__index` hash key `link`. It runs only after
+/// `link`'s witness is checked and its field is guarded to be a table.
 #[inline(always)]
 fn linked_table<'src, 'intern>(owner: &Owner, state: &RunState<'src, 'intern>, at: TableAt, link: HashRef) -> Option<Tc<Table<'src, 'intern>>> {
     let witness = state.hash_witnesses[state.witness_base + link.0 as usize];
@@ -3886,7 +3883,8 @@ impl Context {
                     mine.clear_checks();
                 },
                 Some(theirs) if theirs.idx == mine.idx && theirs.key == mine.key && theirs.place == mine.place && theirs.chain == mine.chain && mine.known_type.is_some() && theirs.known_type.is_some() => {
-                    // Looking again holds whether or not a witness was made.
+                    // A key either side found missing has no witness to check, and looking for
+                    // the key again is correct either way.
                     mine.missing |= theirs.missing;
                     if mine.known_type != theirs.known_type {
                         mine.known_type = mine.known_type.as_ref().zip(theirs.known_type.as_ref()).map(|(mine, theirs)| mine.join(theirs));
@@ -4119,8 +4117,8 @@ impl Context {
         depth
     }
 
-    /// Where running code finds the table at `place`, for a register holding a userdata if
-    /// `userdata`, and the `__index` hash key it is found through, if any. See Note [Table
+    /// Where running code finds the table at `place`, and the `__index` hash key it is found
+    /// through, if any. `userdata` is whether the register holds a userdata. See Note [Table
     /// metatables].
     fn table_at(&self, place: Place, userdata: bool) -> (TableAt, Option<HashRef>) {
         match place {
@@ -7297,7 +7295,7 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             }
             let at = PackedHref::pack(href, index);
-            // A table lacking the key it's chained for expects to.
+            // A chained load whose table lacks the key expects it to stay missing.
             let miss = chained && entry.is_none() && match place {
                 Place::Register => receiver == LType::Table,
                 Place::Index(_) => true,
@@ -7317,9 +7315,9 @@ impl<'src, 'intern> Specializer<'src, 'intern> {
                 }
             });
 
-            // `HrefInit` for a key a table found from the register was found without, as an object
-            // lacks its class's methods. It makes no witness. Exit 0 if the table lacks the key and 1
-            // if not. No table there lacks it. See Note [Table metatables].
+            // `HrefInit` for a key the table was found without, as an object lacks its class's
+            // methods. It makes no witness. Exit 0 if the table found from the register lacks the
+            // key or there is no table there, and 1 if it has the key. See Note [Table metatables].
             windowed!(writes HrefInitMissOf, [at: PackedHref, key: u64, hash: u64], [AT: TableAt], |owner, state, base| (of) {
                 register_table(owner, state, AT, of).is_some_and(|tab| !lacks(owner, &tab, key, hash))
             } cold {
